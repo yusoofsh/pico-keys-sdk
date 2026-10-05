@@ -35,6 +35,10 @@ extern uint32_t flash_size(void);
 
 extern void flash_set_bounds(uintptr_t start, uintptr_t end);
 extern bool low_flash_storage_locked(void);
+#if defined(ENABLE_EMULATION)
+// Emulation-only test hook (see low_flash.c). Never compiled in firmware.
+extern void low_flash_storage_force_locked(bool locked);
+#endif
 extern int flash_write_data_to_file(file_t *file, const_byte_array_t data);
 extern int flash_write_data_to_file_offset(file_t *file, const_byte_array_t data, uint32_t offset);
 extern int flash_program_block(uintptr_t addr, const_byte_array_t data);

@@ -113,6 +113,15 @@ bool low_flash_storage_locked(void) {
     return storage_locked;
 }
 
+#if defined(ENABLE_EMULATION)
+// Emulation-only test hook: force the storage-locked state without running
+// the RP2040 boot stage, so host tests can drive the application entry
+// points in the locked state. Firmware builds never compile this.
+void low_flash_storage_force_locked(bool locked) {
+    storage_locked = locked;
+}
+#endif
+
 //this function has to be called from the core 0
 void low_flash_task(void);
 void low_flash_commit(void);
