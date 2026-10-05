@@ -179,6 +179,13 @@ static int copy_file_range(const file_t *source, uint32_t source_offset, uintptr
 static int flash_write_data_to_file_internal(file_t *file, const_byte_array_t data, uint32_t offset, bool partial) {
     uint32_t len = 0;
 
+    if (low_flash_storage_locked()) {
+        // Refuse before anything dereferences the pool bounds: with the
+        // storage locked none were published and the allocator would read
+        // address 0.
+        return PICOKEYS_ERR_BLOCKED;
+    }
+
     if (!file || (!data.data && data.len > 0) || data.len > UINT32_MAX) {
         return PICOKEYS_ERR_NULL_PARAM;
     }

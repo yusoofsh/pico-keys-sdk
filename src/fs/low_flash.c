@@ -442,6 +442,12 @@ static bool journal_entry_valid_at(const flash_journal_t *entry, uintptr_t journ
 
 int low_flash_recover_journal(bool force) {
 #if defined(PICO_PLATFORM) || defined(ESP_PLATFORM)
+    if (storage_locked) {
+        // No bounds were published: the journal sector is derived from
+        // last_base, which would underflow to 0xfffff000 here.
+        printf("INFO: STORAGE LOCKED: SKIP JOURNAL RECOVERY\n");
+        return PICOKEYS_ERR_BLOCKED;
+    }
     uintptr_t journal_sector = FLASH_SECTOR(last_base) - FLASH_SECTOR_SIZE;
     if (journal_sector < start_data_pool) {
         printf("WARN: FLASH JOURNAL SECTOR OUT OF RANGE\n");
@@ -539,6 +545,11 @@ int low_flash_recover_journal(bool force) {
 }
 
 int low_flash_first_init(void) {
+    if (storage_locked) {
+        // First-init seeds writes at the pool bounds; with the storage
+        // locked those bounds are zero, so refuse instead.
+        return PICOKEYS_ERR_BLOCKED;
+    }
     uint8_t empty[sizeof(uintptr_t) + sizeof(uint32_t)];
     memset(empty, 0, sizeof(empty));
 

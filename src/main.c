@@ -174,10 +174,15 @@ int main(void) {
 
     low_flash_init();
 
-    file_scan_flash();
+    // Storage-locked boots publish no bounds: the flash scan and the keydev
+    // migration (both dereference the pool bounds through the file layer)
+    // must not run at all. The device keeps booting into usb_init below.
+    if (!low_flash_storage_locked()) {
+        file_scan_flash();
 
-    if (rescue_migrate_keydev() != PICOKEYS_OK) {
-        printf("Device attestation key migration failed\n");
+        if (rescue_migrate_keydev() != PICOKEYS_OK) {
+            printf("Device attestation key migration failed\n");
+        }
     }
 
     init_rtc();
