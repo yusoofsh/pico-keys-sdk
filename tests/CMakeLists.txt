@@ -110,26 +110,39 @@ endif()
 add_test(NAME flash_layout_test COMMAND flash_layout_test)
 
 # --- low_flash boot-stage integration harness --------------------------------
-# Compiles the UNMODIFIED production src/fs/low_flash.c with the RP2040 code
-# paths on the host: -DPICO_RP2040, 32-bit uintptr_t semantics (forced-in
-# stubs/force32.h plus MOCK_ARM32_POINTERS) and a fake NOR flash mapped at the
-# real XIP address (0x10000000) with MAP_FIXED_NOREPLACE. The mock implements
-# NOR semantics and records every erase and program call with its offset,
-# length, alignment, interrupt state and multicore lockout depth; the
-# scenarios assert on those records. One executable per variant, because
-# PICO_FLASH_SIZE_BYTES and PICO_FLASH_SIZE_LIMIT_BYTES are compile-time.
+# Compiles the UNMODIFIED production fs sources (src/fs/low_flash.c, flash.c,
+# file.c, files.c and src/tlv.c) with the RP2040 code paths on the host:
+# -DPICO_RP2040, 32-bit uintptr_t semantics (forced-in stubs/force32.h plus
+# MOCK_ARM32_POINTERS) and a fake NOR flash mapped at the real XIP address
+# (0x10000000) with MAP_FIXED_NOREPLACE. The mock implements NOR semantics and
+# records every erase and program call with its offset, length, alignment,
+# interrupt state and multicore lockout depth; the scenarios assert on those
+# records. One executable per variant, because PICO_FLASH_SIZE_BYTES and
+# PICO_FLASH_SIZE_LIMIT_BYTES are compile-time.
 
 set(FLASH_HARNESS_DIR ${CMAKE_CURRENT_LIST_DIR}/flash_harness)
-set(FLASH_HARNESS_SOURCES
+set(FLASH_HARNESS_PROD_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/../src/fs/low_flash.c
     ${CMAKE_CURRENT_LIST_DIR}/../src/fs/flash_layout.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/fs/flash.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/fs/file.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/fs/files.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/tlv.c
     ${FLASH_HARNESS_DIR}/low_flash_mock.c
-    ${FLASH_HARNESS_DIR}/low_flash_scenarios.c
 )
+set(FLASH_HARNESS_SCENARIOS ${FLASH_HARNESS_DIR}/low_flash_scenarios.c)
+
+# The production flash_set_bounds body keeps its real pool math, aliased so the
+# mock can record every bounds publication and then forward to it.
+set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/../src/fs/flash.c
+    PROPERTIES COMPILE_DEFINITIONS "flash_set_bounds=pico_flash_set_bounds")
 
 function(add_low_flash_harness name)
-    cmake_parse_arguments(HARNESS "" "" "DEFS" ${ARGN})
-    add_executable(${name} ${FLASH_HARNESS_SOURCES})
+    cmake_parse_arguments(HARNESS "" "" "DEFS;SOURCES" ${ARGN})
+    if(NOT HARNESS_SOURCES)
+        set(HARNESS_SOURCES ${FLASH_HARNESS_SCENARIOS})
+    endif()
+    add_executable(${name} ${FLASH_HARNESS_PROD_SOURCES} ${HARNESS_SOURCES})
     target_include_directories(${name} BEFORE PRIVATE
         ${FLASH_HARNESS_DIR}       # mock API
         ${FLASH_HARNESS_DIR}/stubs # stub pico-sdk headers shadow the real ones
@@ -163,4 +176,10 @@ if(NOT MSVC)
     # Chips too small for the marker sector: marker handling skipped.
     add_low_flash_harness(low_flash_nolimit1m_test DEFS PICO_FLASH_SIZE_BYTES=0x100000)
     add_low_flash_harness(low_flash_nolimit512k_test DEFS PICO_FLASH_SIZE_BYTES=0x80000)
+    # Storage-locked startup continuation: one fresh process per locking cause
+    # (invalid JEDEC, cap > chip, foreign marker, readback mismatch), plus an
+    # unlocked scan control. The Pipico preset geometry.
+    add_low_flash_harness(low_flash_locked_boot_test
+        SOURCES ${FLASH_HARNESS_DIR}/low_flash_locked_boot.c
+        DEFS PICO_FLASH_SIZE_BYTES=0x400000 PICO_FLASH_SIZE_LIMIT_BYTES=0x200000)
 endif()

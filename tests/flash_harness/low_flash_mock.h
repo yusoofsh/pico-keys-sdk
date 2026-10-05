@@ -38,9 +38,19 @@
 #define MOCK_MAP_SIZE (16u * 1024u * 1024u) // the whole RP2040 XIP window
 #define MOCK_MARKER_OFFSET 0x100000u        // the fixed physical marker sector
 
+/* Build-time flash size of the variant under test: the boundary the pico-sdk
+ * hard_asserts every erase/program against. Every harness variant defines it. */
+#ifndef PICO_FLASH_SIZE_BYTES
+#error "harness variants must define PICO_FLASH_SIZE_BYTES"
+#endif
+/* Only the build-time chip is mapped readable; the rest of the XIP window is
+ * PROT_NONE, so a read beyond the chip faults instead of silently succeeding. */
+#define MOCK_CHIP_BYTES ((uint32_t)(PICO_FLASH_SIZE_BYTES))
+
 /* One recorded hardware interaction, in call order.
  * op: 'C' = flash_do_cmd (offs = command byte), 'E' = erase, 'P' = program,
- * 'B' = flash_set_bounds (offs = start, count = end). */
+ * 'B' = flash_set_bounds (offs = start, count = end; recorded by the wrapper
+ * around the aliased production body, see low_flash_mock.c). */
 typedef struct {
     char op;
     uint32_t offs;

@@ -29,6 +29,7 @@
 
 #include "byte_array.h"
 #include "serial.h"
+#include "apdu.h"
 
 mock_call_t mock_calls[MOCK_MAX_CALLS];
 int mock_ncalls = 0;
@@ -41,16 +42,15 @@ static int irq_disabled = 0;
 static int lockout_depth = 0;
 static int lockout_calls = 0;
 
-/* Build-time flash size of the variant under test: the boundary the pico-sdk
- * hard_asserts every erase/program against. Every harness variant defines it. */
-#ifndef PICO_FLASH_SIZE_BYTES
-#error "harness variants must define PICO_FLASH_SIZE_BYTES"
-#endif
-
-/* Symbols low_flash.c expects from flash.c / serial.c / crypto_utils.c. */
-uint32_t FLASH_SIZE_BYTES = 2 * 1024 * 1024;
-uintptr_t start_data_pool = 0, end_data_pool = 0, end_rom_pool = 0, last_base = 0;
+/* Symbols low_flash.c expects from serial.c / crypto_utils.c. The fs state
+ * (FLASH_SIZE_BYTES, pool bounds, num_files) is the production one from
+ * src/fs/flash.c, which the harness links unmodified. */
 picokey_serial_t pico_serial = { .id = { 1, 2, 3, 4, 5, 6, 7, 8 } };
+
+/* file.c references the APDU state through apdu.h globals; the harness never
+ * processes APDUs, but the storage-locked startup must not touch them anyway. */
+static uint8_t apdu_rdata[672];
+struct apdu apdu = { .rdata = apdu_rdata };
 
 /* Host copy of the SDK crc32c() (src/crypto_utils.c): standard reflected
  * CRC-32, poly 0xEDB88320, byte-identical to the firmware implementation. */
@@ -81,12 +81,20 @@ int mock_map_flash(void) {
         perror("mmap fake flash at the XIP address");
         return -1;
     }
-    memset(flash_mem, 0xFF, MOCK_MAP_SIZE);
+    memset(flash_mem, 0xFF, MOCK_CHIP_BYTES);
+    if (MOCK_MAP_SIZE > MOCK_CHIP_BYTES) {
+        // Reads beyond the build-time chip must fault like they would on real
+        // hardware; keep them out of the mapping entirely.
+        if (mprotect(flash_mem + MOCK_CHIP_BYTES, MOCK_MAP_SIZE - MOCK_CHIP_BYTES, PROT_NONE) != 0) {
+            perror("mprotect beyond-chip XIP window");
+            return -1;
+        }
+    }
     return 0;
 }
 
 void mock_reset(uint8_t jedec_capacity_e) {
-    memset(flash_mem, 0xFF, MOCK_MAP_SIZE);
+    memset(flash_mem, 0xFF, MOCK_CHIP_BYTES);
     mock_jedec_e = jedec_capacity_e;
     mock_program_drop = false;
     api_violations = 0;
@@ -185,12 +193,13 @@ void flash_do_cmd(const uint8_t *txbuf, uint8_t *rxbuf, size_t count) {
 
 /* ---- mocked pico-sdk support functions ---- */
 
+/* The production flash_set_bounds body (src/fs/flash.c) is compiled under the
+ * alias pico_flash_set_bounds (tests/CMakeLists.txt), so the harness records
+ * every bounds publication and then lets the real pool math run. */
+void pico_flash_set_bounds(uintptr_t start, uintptr_t end);
 void flash_set_bounds(uintptr_t start, uintptr_t end) {
     record('B', (uint32_t)start, (size_t)end);
-    start_data_pool = start;
-    end_data_pool = end;
-    end_rom_pool = end;
-    last_base = end;
+    pico_flash_set_bounds(start, end);
 }
 
 uint32_t save_and_disable_interrupts(void) {
@@ -220,13 +229,6 @@ bool multicore_lockout_end_timeout_us(uint64_t us) {
 void multicore_lockout_victim_init(void) {}
 unsigned get_core_num(void) { return 0; }
 uint32_t board_millis(void) { return 0; }
-
-/* Weak fallback so the harness also links against a production low_flash.c
- * from before the storage-locked state existed. The strong definition in
- * low_flash.c always wins once present; this stub only reports "not locked". */
-__attribute__((weak)) bool low_flash_storage_locked(void) {
-    return false;
-}
 
 void reset_usb_boot(uint32_t a, uint32_t b) {
     // The boot stage must never reboot the device; a locked device keeps booting.

@@ -32,10 +32,18 @@
 #include "low_flash_mock.h"
 #include "picokeys.h"
 #include "serial.h"
+#include "file.h"
 
 extern void low_flash_task(void);
 extern void low_flash_init_core1(void);
 extern bool low_flash_storage_locked(void);
+extern int low_flash_recover_journal(bool force);
+extern void file_scan_flash(void);
+
+/* Production fs state (src/fs/flash.c). A locked boot must leave all of it
+ * zero: no usable bounds may be published. */
+extern const uintptr_t end_rom_pool, start_rom_pool, end_data_pool, start_data_pool;
+extern const uintptr_t last_base;
 
 #define MARKER_OFFSET MOCK_MARKER_OFFSET
 #define MARKER_SECTOR (mock_flash() + MARKER_OFFSET)
@@ -56,6 +64,11 @@ static uint32_t fnv1a(const uint8_t *p, size_t n) {
         h *= 16777619u;
     }
     return h;
+}
+
+/* Whole readable chip: reads beyond it are PROT_NONE (see low_flash_mock.h). */
+static uint32_t hash_chip(void) {
+    return fnv1a(mock_flash(), MOCK_CHIP_BYTES);
 }
 
 static void program_valid_marker(void) {
@@ -220,7 +233,7 @@ static __attribute__((unused)) void scenario_foreign_marker(uint8_t jedec_e, for
         sector[100] = 0x00;
         break;
     }
-    uint32_t hash_before = fnv1a(mock_flash(), MOCK_MAP_SIZE);
+    uint32_t hash_before = hash_chip();
     low_flash_init();
     assert_boot_safety();
     assert_zero_writes();
@@ -229,7 +242,7 @@ static __attribute__((unused)) void scenario_foreign_marker(uint8_t jedec_e, for
         assert(mock_calls[i].op != 'B'); // no usable bounds while locked
     }
     // Marker sector plus data region byte-identical to the pre-boot contents.
-    assert(fnv1a(mock_flash(), MOCK_MAP_SIZE) == hash_before);
+    assert(fnv1a(mock_flash(), MOCK_CHIP_BYTES) == hash_before);
 }
 
 /* The page program did not stick: storage locked, no bounds, no further ops. */
@@ -255,10 +268,15 @@ static __attribute__((unused)) void scenario_readback_failure(uint8_t jedec_e) {
     }
 }
 
-/* A boot that ends storage-locked: writes refused, flash untouched. */
+/* A boot that ends storage-locked: writes refused, flash untouched, and the
+ * production startup continuation (exactly what main() runs after
+ * low_flash_init) is a safe no-op instead of a crash through zero bounds.
+ * The zero-bounds state is asserted per cause in low_flash_locked_boot_test;
+ * this suite shares one process, where earlier scenarios legitimately
+ * published bounds. */
 static __attribute__((unused)) void assert_locked_boot(uint8_t jedec_e) {
     mock_reset(jedec_e);
-    uint32_t hash_before = fnv1a(mock_flash(), MOCK_MAP_SIZE);
+    uint32_t hash_before = hash_chip();
     low_flash_init();
     assert_boot_safety();
     assert_zero_writes();
@@ -266,7 +284,16 @@ static __attribute__((unused)) void assert_locked_boot(uint8_t jedec_e) {
     for (int i = 0; i < mock_ncalls; i++) {
         assert(mock_calls[i].op != 'B');
     }
-    assert(fnv1a(mock_flash(), MOCK_MAP_SIZE) == hash_before);
+    // main() continues here: the file scan and the journal recovery must be
+    // safe refusals, not reads through the zero bounds (address 0, or the
+    // 0xfffff000 journal-sector underflow).
+    file_scan_flash();
+    assert(low_flash_storage_locked());
+    assert_zero_writes();
+    assert(hash_chip() == hash_before);
+    assert(low_flash_recover_journal(false) == PICOKEYS_ERR_BLOCKED);
+    assert_zero_writes();
+    assert(hash_chip() == hash_before);
 }
 
 /* Storage-locked state keeps booting but refuses every later write. */
@@ -275,12 +302,16 @@ static __attribute__((unused)) void scenario_locked_writes(void) {
     const uintptr_t addr = MOCK_XIP_BASE + 0x101000u + 0x4000u; // inside the data region
     uint8_t buf[16];
     memset(buf, 0xA5, sizeof(buf));
-    uint32_t hash_before = fnv1a(mock_flash(), MOCK_MAP_SIZE);
+    uint32_t hash_before = hash_chip();
 
     assert(flash_program_block(addr, CONST_BYTE_ARRAY(buf, sizeof(buf))) == PICOKEYS_ERR_BLOCKED);
     assert(flash_program_halfword(addr, 0x1234) == PICOKEYS_ERR_BLOCKED);
     assert(flash_program_word(addr, 0xDEADBEEFu) == PICOKEYS_ERR_BLOCKED);
     assert(flash_program_uintptr(addr, (uintptr_t)0x11223344u) == PICOKEYS_ERR_BLOCKED);
+    // The storage-dependent file-write path must fail with an error too,
+    // never dereference the zero bounds (allocate_free_addr would read
+    // end_data_pool == 0) and never wipe.
+    assert(flash_write_data_to_file(ef_phy, CONST_BYTE_ARRAY(buf, sizeof(buf))) == PICOKEYS_ERR_BLOCKED);
 
     low_flash_init_core1();
     for (int i = 0; i < 8; i++) {
@@ -288,7 +319,7 @@ static __attribute__((unused)) void scenario_locked_writes(void) {
     }
     assert_zero_writes();
     assert(mock_lockout_calls() == 0);
-    assert(fnv1a(mock_flash(), MOCK_MAP_SIZE) == hash_before);
+    assert(fnv1a(mock_flash(), MOCK_CHIP_BYTES) == hash_before);
     assert(low_flash_storage_locked());
 }
 
