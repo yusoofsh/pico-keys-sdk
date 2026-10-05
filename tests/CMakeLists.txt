@@ -108,3 +108,59 @@ else()
 endif()
 
 add_test(NAME flash_layout_test COMMAND flash_layout_test)
+
+# --- low_flash boot-stage integration harness --------------------------------
+# Compiles the UNMODIFIED production src/fs/low_flash.c with the RP2040 code
+# paths on the host: -DPICO_RP2040, 32-bit uintptr_t semantics (forced-in
+# stubs/force32.h plus MOCK_ARM32_POINTERS) and a fake NOR flash mapped at the
+# real XIP address (0x10000000) with MAP_FIXED_NOREPLACE. The mock implements
+# NOR semantics and records every erase and program call with its offset,
+# length, alignment, interrupt state and multicore lockout depth; the
+# scenarios assert on those records. One executable per variant, because
+# PICO_FLASH_SIZE_BYTES and PICO_FLASH_SIZE_LIMIT_BYTES are compile-time.
+
+set(FLASH_HARNESS_DIR ${CMAKE_CURRENT_LIST_DIR}/flash_harness)
+set(FLASH_HARNESS_SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/../src/fs/low_flash.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/fs/flash_layout.c
+    ${FLASH_HARNESS_DIR}/low_flash_mock.c
+    ${FLASH_HARNESS_DIR}/low_flash_scenarios.c
+)
+
+function(add_low_flash_harness name)
+    cmake_parse_arguments(HARNESS "" "" "DEFS" ${ARGN})
+    add_executable(${name} ${FLASH_HARNESS_SOURCES})
+    target_include_directories(${name} BEFORE PRIVATE
+        ${FLASH_HARNESS_DIR}       # mock API
+        ${FLASH_HARNESS_DIR}/stubs # stub pico-sdk headers shadow the real ones
+        ${CMAKE_CURRENT_LIST_DIR}/../src
+        ${CMAKE_CURRENT_LIST_DIR}/../src/fs
+    )
+    target_compile_definitions(${name} PRIVATE PICO_RP2040 MOCK_ARM32_POINTERS ${HARNESS_DEFS})
+    if(MSVC)
+        message(FATAL_ERROR "the low_flash harness needs mmap and GCC-style flags")
+    else()
+        target_compile_options(${name} PRIVATE
+            -include ${FLASH_HARNESS_DIR}/stubs/force32.h
+            -Wall -Wextra -Werror
+            -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast
+        )
+    endif()
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+if(NOT MSVC)
+    # The Pipico preset: 4 MiB board, 2 MiB cap. Full scenario suite.
+    add_low_flash_harness(low_flash_capped4m_test DEFS PICO_FLASH_SIZE_BYTES=0x400000 PICO_FLASH_SIZE_LIMIT_BYTES=0x200000)
+    # 2 MiB board with a 2 MiB cap; misaligned and too-small caps fail closed.
+    add_low_flash_harness(low_flash_capped2m_test DEFS PICO_FLASH_SIZE_BYTES=0x200000 PICO_FLASH_SIZE_LIMIT_BYTES=0x200000)
+    add_low_flash_harness(low_flash_cap_misaligned_test DEFS PICO_FLASH_SIZE_BYTES=0x400000 PICO_FLASH_SIZE_LIMIT_BYTES=0x200800)
+    add_low_flash_harness(low_flash_cap_too_small_test DEFS PICO_FLASH_SIZE_BYTES=0x400000 PICO_FLASH_SIZE_LIMIT_BYTES=0x100000)
+    # Uncapped boards keep the upstream layout apart from the build-time clamp.
+    add_low_flash_harness(low_flash_nolimit2m_test DEFS PICO_FLASH_SIZE_BYTES=0x200000)
+    add_low_flash_harness(low_flash_nolimit4m_test DEFS PICO_FLASH_SIZE_BYTES=0x400000)
+    add_low_flash_harness(low_flash_nolimit16m_test DEFS PICO_FLASH_SIZE_BYTES=0x1000000)
+    # Chips too small for the marker sector: marker handling skipped.
+    add_low_flash_harness(low_flash_nolimit1m_test DEFS PICO_FLASH_SIZE_BYTES=0x100000)
+    add_low_flash_harness(low_flash_nolimit512k_test DEFS PICO_FLASH_SIZE_BYTES=0x80000)
+endif()
