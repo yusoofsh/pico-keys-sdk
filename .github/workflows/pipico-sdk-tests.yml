@@ -1,7 +1,8 @@
 # Pipico mission CI: runs the SDK host test suite with the same commands as the
 # local gate runner (cmake -S tests, ninja, ctest): the three upstream object
 # tests, the pure flash_layout unit tests and the low_flash boot-stage
-# integration harness. Read-only: no secrets and no write permissions.
+# integration harness, plus the flash-size-limit python regression.
+# Read-only: no secrets and no write permissions.
 name: pipico-sdk-tests
 
 on:
@@ -35,3 +36,6 @@ jobs:
 
       - name: Run the host tests
         run: ctest --test-dir build-tests --output-on-failure
+
+      - name: Run the flash-size-limit python regression
+        run: python3 tests/test_flash_size_limit.py
