@@ -345,10 +345,18 @@ uint8_t const *tud_descriptor_bos_cb(void) {
 
 // array of pointer to string descriptors
 char *string_desc_itf[5] = {0};
+
+// Product string (index 2). Products may brand it with a compile definition,
+// e.g. -DUSB_PRODUCT_STRING="\"...\"". A phy-config usb_product still takes
+// precedence at runtime. The default is unchanged.
+#ifndef USB_PRODUCT_STRING
+#define USB_PRODUCT_STRING "Pico Key"
+#endif
+
 char const *string_desc_arr [] = {
     (const char[]) { 0x09, 0x04 }, // 0: is supported language is English (0x0409)
     "Pol Henarejos",                     // 1: Manufacturer
-    "Pico Key",                       // 2: Product
+    USB_PRODUCT_STRING,                  // 2: Product
     "11223344",                      // 3: Serials, should use chip ID
     "MAC"                   // 4: MAC address string, handled separately
     , "HID Interface"
