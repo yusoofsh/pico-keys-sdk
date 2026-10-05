@@ -104,9 +104,15 @@ add_compile_definitions(USB_PID=${USB_PID})
 if(NOT DEFINED DEBUG_APDU)
     set(DEBUG_APDU 0)
 endif()
-# Cap the auto-detected flash size, e.g. -DPICO_FLASH_SIZE_LIMIT_BYTES=0x200000
-# on boards whose upper flash half is unusable for the data pool.
+# RP2040-only JEDEC cap, e.g. -DPICO_FLASH_SIZE_LIMIT_BYTES=0x200000.
+# low_flash.c rejects other platforms at compile time; cap VALUES are
+# validated at boot by compute_layout(), which locks the storage on an
+# invalid value instead of failing the build.
+# Hardware evidence for this option is limited to YD-RP2040 4MB with a 2 MiB cap.
 if(DEFINED PICO_FLASH_SIZE_LIMIT_BYTES)
+    if(ESP_PLATFORM OR ENABLE_EMULATION)
+        message(FATAL_ERROR "PICO_FLASH_SIZE_LIMIT_BYTES is only supported on RP2040")
+    endif()
     add_compile_definitions(PICO_FLASH_SIZE_LIMIT_BYTES=${PICO_FLASH_SIZE_LIMIT_BYTES})
 endif()
 if(NOT DEFINED ENABLE_EMULATION)

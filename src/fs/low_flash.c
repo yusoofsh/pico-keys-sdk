@@ -73,6 +73,19 @@ extern uint32_t FLASH_SIZE_BYTES;
 #define FLASH_SIZE_BYTES   (8 * 1024 * 1024)
 #endif
 
+#ifdef PICO_FLASH_SIZE_LIMIT_BYTES
+ // The cap is an RP2040-only option; picokeys_sdk_import.cmake rejects it at
+ // configure time on ESP32 and emulation too. Cap VALUES are validated at
+ // boot by compute_layout() (positive, sector-aligned, not larger than the
+ // clamped capacity, enough pool+journal headroom): an invalid value locks
+ // the storage instead of failing the build, so misaligned and too-small
+ // caps stay testable fail-closed in the host harness.
+ #if !defined(PICO_RP2040) || !PICO_RP2040 || defined(PICO_RP2350) || \
+     defined(ESP_PLATFORM) || defined(ENABLE_EMULATION)
+  #error "PICO_FLASH_SIZE_LIMIT_BYTES is only supported on RP2040"
+ #endif
+#endif
+
 #define TOTAL_FLASH_PAGES 6
 #define FLASH_CACHE_FLUSH_TIMEOUT_MS 5000u
 
@@ -699,7 +712,10 @@ void low_flash_init(void) {
     uint8_t rxbuf[6] = {0};
     flash_do_cmd(txbuf, rxbuf, 4);
 
-    FLASH_SIZE_BYTES = (1 << rxbuf[3]);
+    // RP2040 JEDEC validation and the whole RP2040 boot stage live in
+    // low_flash_init_rp2040() above; this branch is RP2350 only. The shift is
+    // unsigned so a large exponent cannot invoke signed-overflow UB.
+    FLASH_SIZE_BYTES = (1u << rxbuf[3]);
 #ifdef PICO_FLASH_SIZE_BYTES
     // Clamp the detected capacity to the build-time board size: the pico-sdk
     // hard_asserts every erase and program against it.
@@ -1022,6 +1038,7 @@ typedef struct {
     uint8_t  uid[PICO_UNIQUE_BOARD_ID_SIZE_BYTES];
     uint32_t crc32;
 } __attribute__ ((packed)) phymarker_t;
+_Static_assert(sizeof(phymarker_t) <= FLASH_PAGE_SIZE, "Physical marker must fit in one flash page");
 
 uintptr_t __phymarker_start = (uintptr_t)0x10100000;
 
