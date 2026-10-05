@@ -1,0 +1,37 @@
+# Pipico mission CI: runs the SDK host test suite with the same commands as the
+# local gate runner (cmake -S tests, ninja, ctest): the three upstream object
+# tests, the pure flash_layout unit tests and the low_flash boot-stage
+# integration harness. Read-only: no secrets and no write permissions.
+name: pipico-sdk-tests
+
+on:
+  push:
+    branches:
+      - 'pipico/**'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the pushed commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch mbedtls v3.6.7 (configure-time dependency of tests/)
+        run: |
+          git clone -q --depth 1 -b v3.6.7 https://github.com/Mbed-TLS/mbedtls.git third-party/mbedtls
+          git -C third-party/mbedtls checkout -q 068ff080b369adfac81509f9b57b2afabaf82dc5
+
+      - name: Configure the host tests
+        run: cmake -S tests -B build-tests -G Ninja
+
+      - name: Build the host tests
+        run: ninja -C build-tests
+
+      - name: Run the host tests
+        run: ctest --test-dir build-tests --output-on-failure
