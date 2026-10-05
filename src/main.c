@@ -46,60 +46,8 @@
 
 extern int rescue_migrate_keydev(void);
 
-app_t apps[16];
-uint8_t num_apps = 0;
-
-app_t *current_app = NULL;
-
-const uint8_t *ccid_atr = NULL;
-
-bool app_exists(const_byte_array_t aid) {
-    for (int a = 0; a < num_apps; a++) {
-        if (aid.len >= apps[a].aid[0] && !memcmp(apps[a].aid + 1, aid.data, apps[a].aid[0])) {
-            return true;
-        }
-    }
-    return false;
-}
-
-int register_app(int (*select_aid)(app_t *, uint8_t), const uint8_t *aid) {
-    if (app_exists(CONST_BYTE_ARRAY(aid + 1, aid[0]))) {
-        return 1;
-    }
-    if (num_apps < sizeof(apps) / sizeof(app_t)) {
-        apps[num_apps].select_aid = select_aid;
-        apps[num_apps].aid = aid;
-        num_apps++;
-        return 1;
-    }
-    return 0;
-}
-
-int select_app(const_byte_array_t aid) {
-    if (current_app && current_app->aid && (current_app->aid + 1 == aid.data || (aid.len >= current_app->aid[0] && !memcmp(current_app->aid + 1, aid.data, current_app->aid[0])))) {
-        current_app->select_aid(current_app, 0);
-        return PICOKEYS_OK;
-    }
-    for (int a = 0; a < num_apps; a++) {
-        if (aid.len >= apps[a].aid[0] && !memcmp(apps[a].aid + 1, aid.data, apps[a].aid[0])) {
-            if (current_app) {
-                if (current_app->aid && aid.len >= current_app->aid[0] && !memcmp(current_app->aid + 1, aid.data, current_app->aid[0])) {
-                    current_app->select_aid(current_app, 1);
-                    return PICOKEYS_OK;
-                }
-                if (current_app->unload) {
-                    current_app->unload();
-                }
-            }
-            current_app = &apps[a];
-            if (current_app->select_aid(current_app, 1) == PICOKEYS_OK) {
-                return PICOKEYS_OK;
-            }
-        }
-    }
-    return PICOKEYS_ERR_FILE_NOT_FOUND;
-}
-
+// The application registry (apps, select_app, register_app) and the CCID ATR
+// pointer live in app.c.
 
 WEAK int picokey_init(void) {
     return 0;

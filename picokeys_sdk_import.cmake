@@ -363,6 +363,7 @@ elseif(PICO_RP2040)
 endif()
 
 list(APPEND PICOKEYS_SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/src/app.c
     ${CMAKE_CURRENT_LIST_DIR}/src/main.c
     ${CMAKE_CURRENT_LIST_DIR}/src/usb/usb.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fs/file.c
