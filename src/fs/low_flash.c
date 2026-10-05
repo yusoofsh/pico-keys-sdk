@@ -610,6 +610,47 @@ static void phymarker_stage(bool marker_in_chip) {
         storage_locked = true;
     }
 }
+
+// RP2040 boot stage, in order:
+// 1. the JEDEC read has already run;
+// 2. validate the capacity and compute the layout - any error locks the
+//    storage before a single flash write happens;
+// 3. handle the physical marker;
+// 4. flash_set_bounds last, only when every check passed.
+static void low_flash_init_rp2040(uint8_t jedec_capacity_e) {
+    uint32_t detected_bytes = 0;
+    if (validate_jedec_capacity(jedec_capacity_e, &detected_bytes) != FLASH_LAYOUT_OK) {
+        printf("WARN: FLASH CAPACITY INVALID (JEDEC 0x%02x): STORAGE LOCKED\n", (unsigned)jedec_capacity_e);
+        storage_locked = true;
+        return;
+    }
+#ifdef PICO_FLASH_SIZE_BYTES
+    const uint32_t build_time_bytes = PICO_FLASH_SIZE_BYTES;
+#else
+    const uint32_t build_time_bytes = detected_bytes; // no build-time size: nothing to clamp to
+#endif
+    flash_layout_t layout;
+#ifdef PICO_FLASH_SIZE_LIMIT_BYTES
+    // The marker-gap exclusion is a capped-build rule; compute_layout applies
+    // it only when the cap is defined, so uncapped boards keep their layout.
+    const int layout_rc = compute_layout(detected_bytes, build_time_bytes, true, PICO_FLASH_SIZE_LIMIT_BYTES,
+                                         __phymarker_start - XIP_BASE, FLASH_SECTOR_SIZE, FLASH_LAYOUT_RP2040, &layout);
+#else
+    const int layout_rc = compute_layout(detected_bytes, build_time_bytes, false, 0,
+                                         __phymarker_start - XIP_BASE, FLASH_SECTOR_SIZE, FLASH_LAYOUT_RP2040, &layout);
+#endif
+    if (layout_rc != FLASH_LAYOUT_OK) {
+        printf("WARN: FLASH LAYOUT INVALID: STORAGE LOCKED\n");
+        storage_locked = true;
+        return;
+    }
+    FLASH_SIZE_BYTES = layout.data_end;
+    phymarker_stage(!layout.marker_skipped);
+    if (storage_locked) {
+        return; // no usable bounds while the storage is locked
+    }
+    flash_set_bounds(XIP_BASE + layout.data_start, XIP_BASE + layout.data_end);
+}
 #endif
 //this function has to be called from the core 0
 void low_flash_init(void) {
@@ -624,23 +665,31 @@ void low_flash_init(void) {
     data_start_addr = 0;
     data_end_addr = part0->size;
     FLASH_SIZE_BYTES = part0->size;
-#elif defined(PICO_PLATFORM)
+#elif defined(PICO_RP2040)
+    // Boot-stage order: JEDEC read, then validate the capacity and compute the
+    // layout BEFORE any flash mutation, then the marker handling, and
+    // flash_set_bounds last (low_flash_init_rp2040).
+    uint8_t txbuf[6] = {0x9f};
+    uint8_t rxbuf[6] = {0};
+    flash_do_cmd(txbuf, rxbuf, 4);
+    low_flash_init_rp2040(rxbuf[3]);
+    return;
+#elif defined(PICO_PLATFORM) // PICO_RP2350: partition-table logic, unchanged apart from the clamps
     uint8_t txbuf[6] = {0x9f};
     uint8_t rxbuf[6] = {0};
     flash_do_cmd(txbuf, rxbuf, 4);
 
     FLASH_SIZE_BYTES = (1 << rxbuf[3]);
+#ifdef PICO_FLASH_SIZE_BYTES
+    // Clamp the detected capacity to the build-time board size: the pico-sdk
+    // hard_asserts every erase and program against it.
+    if (FLASH_SIZE_BYTES > PICO_FLASH_SIZE_BYTES) {
+        FLASH_SIZE_BYTES = PICO_FLASH_SIZE_BYTES;
+    }
+#endif
 #ifdef PICO_FLASH_SIZE_LIMIT_BYTES
     if (FLASH_SIZE_BYTES > PICO_FLASH_SIZE_LIMIT_BYTES) {
         FLASH_SIZE_BYTES = PICO_FLASH_SIZE_LIMIT_BYTES;
-    }
-#endif
-#ifdef PICO_RP2040
-    // The marker stage needs the detected capacity first: never write outside
-    // the chip, and never mutate the flash before the geometry is known.
-    phymarker_stage((uint64_t)(__phymarker_start - XIP_BASE) + FLASH_SECTOR_SIZE <= FLASH_SIZE_BYTES);
-    if (low_flash_storage_locked()) {
-        return; // no usable bounds while the storage is locked
     }
 #endif
 #ifdef PICO_RP2350
@@ -666,17 +715,7 @@ void low_flash_init(void) {
         }
     }
     data_end_addr -= 2 * FLASH_SECTOR_SIZE;
-#else
-    data_start_addr = (FLASH_SIZE_BYTES >> 1);
-    data_end_addr = FLASH_SIZE_BYTES;
 #endif
-#ifdef PICO_RP2040
-    // The physical marker sector is hard-coded at 1MB; never let the data pool include it.
-    if (data_start_addr <= __phymarker_start - XIP_BASE) {
-        data_start_addr = __phymarker_start - XIP_BASE + FLASH_SECTOR_SIZE;
-    }
-#endif
-
     data_start_addr += XIP_BASE;
     data_end_addr += XIP_BASE;
 #else
