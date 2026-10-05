@@ -94,3 +94,17 @@ else()
 endif()
 
 add_test(NAME object_policy_test COMMAND object_policy_test)
+
+add_executable(flash_layout_test
+    ${CMAKE_CURRENT_LIST_DIR}/../src/fs/flash_layout.c
+    ${CMAKE_CURRENT_LIST_DIR}/flash_layout_test.c
+)
+target_include_directories(flash_layout_test PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src ${CMAKE_CURRENT_LIST_DIR}/../src/fs)
+
+if(MSVC)
+    target_compile_options(flash_layout_test PRIVATE /W4 /WX)
+else()
+    target_compile_options(flash_layout_test PRIVATE -Wall -Wextra -Werror)
+endif()
+
+add_test(NAME flash_layout_test COMMAND flash_layout_test)
