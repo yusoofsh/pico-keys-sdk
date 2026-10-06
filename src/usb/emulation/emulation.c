@@ -51,6 +51,7 @@ typedef int socklen_t;
 #include "usb.h"
 #include "ccid/ccid.h"
 #include "hid/ctap_hid.h"
+#include "button_emul.h"
 
 #define PICOKEYS_EMULATION_DISABLE_CCID_ENV "PICOKEYS_EMULATION_DISABLE_CCID"
 
@@ -99,6 +100,10 @@ static int msleep(long msec) {
 
 int emul_init(const char *host, uint16_t port) {
     fprintf(stderr, "\n Starting emulation envionrment\n");
+    /* emul_init runs on the main-loop thread; record it so emulated-button
+     * waits from the transports served by this thread can avoid blocking on
+     * their own queues. */
+    emul_button_note_main_thread();
 #ifdef _MSC_VER
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {

@@ -626,6 +626,7 @@ if(ENABLE_EMULATION)
     add_compile_definitions(ENABLE_EMULATION)
     list(APPEND PICOKEYS_SOURCES
         ${CMAKE_CURRENT_LIST_DIR}/src/usb/emulation/emulation.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/usb/emulation/button_emul.c
     )
     if(USE_OPENSSL_EMULATION_WRAPPER)
         list(APPEND PICOKEYS_SOURCES
