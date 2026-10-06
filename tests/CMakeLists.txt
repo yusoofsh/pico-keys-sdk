@@ -163,7 +163,7 @@ add_executable(hid_cancel_retry_test
     ${CMAKE_CURRENT_LIST_DIR}/../src/usb/emulation/button_emul.c
     ${CMAKE_CURRENT_LIST_DIR}/hid_cancel_retry_test.c
 )
-target_compile_definitions(hid_cancel_retry_test PRIVATE ENABLE_EMULATION USB_ITF_HID=1 USB_ITF_CCID=1 FORCE_BUTTON_WAIT)
+target_compile_definitions(hid_cancel_retry_test PRIVATE ENABLE_EMULATION USB_ITF_HID=1 USB_ITF_CCID=1 FORCE_BUTTON_WAIT HID_CANCEL_TEST_HOOKS)
 target_include_directories(hid_cancel_retry_test PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../src
     ${CMAKE_CURRENT_LIST_DIR}/../src/fs
@@ -177,7 +177,7 @@ else()
     target_compile_options(hid_cancel_retry_test PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(hid_cancel_retry_test PRIVATE pthread)
 endif()
-foreach(scene IN ITEMS fast_retry fast_retry_fragmented fast_retry_max_size cancel_before_wait_start settled_retry no_retry_after_cancel press_control competing_cid_during_unwind init_after_cancel_active_wait init_during_active_wait)
+foreach(scene IN ITEMS fast_retry fast_retry_fragmented fast_retry_max_size cancel_before_wait_start settled_retry no_retry_after_cancel press_control competing_cid_during_unwind init_after_cancel_active_wait init_during_active_wait ping_echo_during_completion randomized_a randomized_b randomized_c)
     add_test(NAME hid_cancel_retry_${scene} COMMAND hid_cancel_retry_test ${scene})
 endforeach()
 

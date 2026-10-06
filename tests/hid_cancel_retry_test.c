@@ -67,6 +67,8 @@
 extern void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize);
 extern void hid_task(void);
 extern void button_task(void);
+/* Failure-dump accessor (hid.c compiles it with HID_CANCEL_TEST_HOOKS). */
+extern void hid_cancel_test_state(uint8_t *txn_state, uint32_t *txn_cid, unsigned *def_count, bool *cancel_marker);
 
 /* ------------------------------------------------------------------ *
  * Mocks for the symbols the production sources reference but that live
@@ -219,7 +221,10 @@ static void write_btn(const char *text) {
 }
 
 static void env_setup(void) {
-    snprintf(btn_file, sizeof(btn_file), "/tmp/picokeys_hid_cancel_retry_test.cmd");
+    /* Unique per process: ctest -j runs the long randomized scenes
+     * concurrently, and a shared control file would leak presses across
+     * processes. */
+    snprintf(btn_file, sizeof(btn_file), "/tmp/picokeys_hid_cancel_retry_test_%d.cmd", (int) getpid());
     snprintf(btn_tmp, sizeof(btn_tmp), "%s.tmp", btn_file);
     setenv("PICOKEYS_EMULATION_BUTTON_FILE", btn_file, 1);
     unsetenv("PICOKEYS_EMULATION_BUTTON_TIMEOUT");
@@ -231,6 +236,7 @@ static void env_setup(void) {
  * CTAPHID packet helpers.
  * ------------------------------------------------------------------ */
 static const uint32_t CID = 0x0a0b0c0d;
+static const uint32_t CID_B = 0x11223344;
 static uint8_t report[HID_RPT_SIZE];
 
 static void put32(uint8_t *p, uint32_t v) {
@@ -1176,6 +1182,656 @@ static void scene_init_during_active_wait(void) {
            "and the resynced channel works\n");
 }
 
+/* ------------------------------------------------------------------ *
+ * Seeded randomized-ordering scene.
+ *
+ * Drives the same production state machine through a few thousand
+ * pseudo-randomly ordered legal host sequences (three fixed seeds, one
+ * ctest entry each) and checks the consolidated cancel-path invariants
+ * after every iteration:
+ * - no hang: a per-iteration pump-step budget fails the scene instead of
+ *   tripping the 30 s alarm;
+ * - every request is processed exactly once with a correctly framed
+ *   response, or answered with an explicit CTAPHID error (CHANNEL_BUSY
+ *   only for a channel that does not own the in-flight transaction);
+ * - a cancelled request's late completion is dropped exactly once (no
+ *   response frame for it, the marker cleared by the end);
+ * - exactly one fabricated 0x2D keepalive-cancel per cancelled request;
+ * - no stale or unaccounted frame in the captured TX window.
+ *
+ * Iteration shapes (chosen by the PRNG):
+ * - CANCEL during an active UP wait or in the pre-start window, then a
+ *   same-channel retry of 1, 4 or 129 reports interleaved with
+ *   other-channel PING/INIT/CBOR traffic, optionally a press racing the
+ *   cancellation delivery, then the unwind;
+ * - a press completing the wait (no cancel);
+ * - a same-channel INIT resync aborting an active wait, then a fresh
+ *   command on the resynced channel.
+ *
+ * Model exclusions (documented production behavior outside the cancel
+ * path's scope, not exercised as defects here):
+ * - a CBOR command admitted while a DIFFERENT channel's UP wait is
+ *   active without a cancellation is swallowed by the wait's event loop
+ *   upstream; the scene only sends other-channel CBOR inside the unwind
+ *   window (answered CHANNEL_BUSY by the admission gate) or when no wait
+ *   is active (processed exactly once);
+ * - a same-channel INIT resync discards the reports buffered for the
+ *   dead session by design, so the scene never orphans buffered retry
+ *   reports behind a resync: the resync mode sends no retry traffic.
+ * The op engine only pumps hid_task() while the unwind window is open
+ * (the cancellation is delivered exclusively by button_task()), so every
+ * buffered/answered outcome stays deterministic under the fixed seed.
+ * On any failure the seed, iteration, phase and line are printed.
+ * ------------------------------------------------------------------ */
+#include <stdint.h>
+
+#define RND_MAX_B_OPS 8
+static uint64_t rnd_seed = 0;
+static int rnd_iter = -1;
+static const char *rnd_phase = "start";
+static int rnd_steps = 0;
+
+/* Filled per iteration by scene_randomized for the failure dump. */
+static int rnd_dbg_mode = -1, rnd_dbg_kind = -1, rnd_dbg_nb = -1, rnd_dbg_press = -1;
+static int rnd_count_responses(int tx_start);
+
+static void rnd_dbg_dump(void) {
+    int resp = -1;
+    if (tx_count > 0) {
+        resp = rnd_count_responses(0);
+    }
+    uint8_t txn_state = 0;
+    uint32_t txn_cid = 0;
+    unsigned def_count = 0;
+    bool cancel_marker = false;
+    hid_cancel_test_state(&txn_state, &txn_cid, &def_count, &cancel_marker);
+    fprintf(stderr,
+            "  dbg: mode=%d kind=%d n_b=%d press=%d parse=%d tx=%d resp=%d busy=%d pending=%d marker=%d "
+            "wk(c=%d p=%d t=%d) cp=%d flags=%d/%d txn=%u cid=%08x def=%u cbtn=%d\n",
+            rnd_dbg_mode, rnd_dbg_kind, rnd_dbg_nb, rnd_dbg_press,
+            mock_parse_calls, tx_count, resp, is_busy(), is_req_button_pending(), exec_finished_cancelled,
+            worker_cancelled, worker_pressed, worker_timed_out, worker_cancel_parse_count,
+            mock_up_flag_head, mock_up_flag_tail, txn_state, txn_cid, def_count, cancel_marker);
+    for (int i = 0; i < tx_count; i++) {
+        const uint8_t *f = tx_frames[i];
+        fprintf(stderr, "  dbg: frame[%d] cid=%02x%02x%02x%02x cmd=%02x bcnth=%02x bcntl=%02d d0=%02x d1=%02x\n",
+                i, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]);
+    }
+}
+
+#define RASSERT(cond) do { \
+    if (!(cond)) { \
+        fprintf(stderr, "randomized: FAIL seed=0x%08llx iter=%d phase=%s line=%d\n", \
+                (unsigned long long) rnd_seed, rnd_iter, rnd_phase, __LINE__); \
+        rnd_dbg_dump(); \
+        fflush(stderr); \
+    } \
+    assert(cond); \
+} while (0)
+
+static uint64_t rng_state = 0;
+static uint32_t rnd_below(uint32_t n) {
+    rng_state += 0x9E3779B97F4A7C15ULL;
+    uint64_t z = rng_state;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z = z ^ (z >> 31);
+    return (uint32_t) ((z >> 32) % n);
+}
+
+/* One 1 ms core0 round. The unwind window is driven with hid_task() only
+ * (rnd_pump_hid): button_task() is what delivers the cancellation, so the
+ * window stays closed until the scene runs a full round (rnd_pump_full). */
+static void rnd_step(void) {
+    rnd_steps++;
+    RASSERT(rnd_steps < 600); /* per-iteration step budget: fail, not hang */
+}
+static void rnd_pump_hid(unsigned rounds) {
+    for (unsigned i = 0; i < rounds; i++) {
+        usleep(1000);
+        hid_task();
+        rnd_step();
+    }
+}
+static void rnd_pump_full(unsigned rounds) {
+    for (unsigned i = 0; i < rounds; i++) {
+        usleep(1000);
+        hid_task();
+        button_task();
+        rnd_step();
+    }
+}
+
+static const uint32_t RND_CID_B = CID_B;
+static uint8_t rnd_b_ping[RND_MAX_B_OPS][4];
+static bool rnd_b_ping_done[RND_MAX_B_OPS];
+static int rnd_b_pings = 0;
+static uint8_t rnd_b_nonce[RND_MAX_B_OPS][8];
+static bool rnd_b_nonce_done[RND_MAX_B_OPS];
+static int rnd_b_inits = 0;
+static int rnd_b_cbor_sent = 0, rnd_b_cbor_admitted = 0;
+static bool rnd_have_resync_init = false;
+static uint8_t rnd_resync_nonce[8];
+static bool rnd_resync_init_done = false;
+
+static void rnd_reset_test_state(void) {
+    tx_count = 0;
+    mock_parse_calls = 0;
+    mock_up_flag_head = 0;
+    mock_up_flag_tail = 0;
+    worker_up_waits = worker_pressed = worker_cancelled = worker_timed_out = 0;
+    worker_cancel_parse_count = -1;
+    worker_parse_index = 0;
+    rnd_b_pings = rnd_b_inits = rnd_b_cbor_sent = rnd_b_cbor_admitted = 0;
+    memset(rnd_b_ping_done, 0, sizeof(rnd_b_ping_done));
+    memset(rnd_b_nonce_done, 0, sizeof(rnd_b_nonce_done));
+    rnd_have_resync_init = false;
+    rnd_resync_init_done = false;
+}
+
+/* A CBOR admission while another command is in flight with NO unwind
+ * marker is either swallowed by an active UP wait or would rebind the
+ * pending response staging (see hid.c resp_data) - both outside the
+ * modeled envelope. Such an op sends a PING instead. */
+enum { RND_OP_PING, RND_OP_INIT, RND_OP_CBOR };
+static int rnd_pick_b_op(void) {
+    int op = (int) rnd_below(3);
+    if (op == RND_OP_CBOR && !exec_finished_cancelled && is_busy()) {
+        op = RND_OP_PING;
+    }
+    return op;
+}
+
+/* Other-channel traffic ops. Outcomes while the unwind window is open
+ * (exec_finished_cancelled set) are deterministic: PING and CBOR are
+ * answered CHANNEL_BUSY by the admission gate, INIT is echoed by the
+ * different-channel allocation branch. After the window closes, a PING is
+ * echoed inline, an INIT echoes, and a CBOR is admitted (the worker is
+ * free or running a wait-free command, so its event is consumed). */
+static void rnd_b_op(int op, uint32_t salt) {
+    if (op == RND_OP_PING) {
+        RASSERT(rnd_b_pings < RND_MAX_B_OPS);
+        uint8_t *p = rnd_b_ping[rnd_b_pings];
+        p[0] = 0x50; p[1] = (uint8_t) rnd_iter; p[2] = (uint8_t) salt; p[3] = (uint8_t) rnd_b_pings;
+        rnd_b_pings++;
+        send_ping_packet(RND_CID_B, p, 4);
+    }
+    else if (op == RND_OP_INIT) {
+        RASSERT(rnd_b_inits < RND_MAX_B_OPS);
+        uint8_t *n = rnd_b_nonce[rnd_b_inits];
+        n[0] = 0xB5; n[1] = (uint8_t) rnd_iter; n[2] = (uint8_t) salt;
+        n[3] = (uint8_t) rnd_b_inits; n[4] = 0x11; n[5] = 0x22; n[6] = 0x33; n[7] = 0x44;
+        rnd_b_inits++;
+        send_init_packet(RND_CID_B, n);
+    }
+    else { /* CBOR */
+        RASSERT(rnd_b_cbor_sent < RND_MAX_B_OPS);
+        rnd_b_cbor_sent++;
+        mock_up_push(false); /* consumed only if actually admitted */
+        memset(report, 0, sizeof(report));
+        put32(report, RND_CID_B);
+        report[4] = CTAPHID_CBOR;
+        report[6] = 5;
+        report[7] = 0x06; report[8] = (uint8_t) rnd_iter; report[9] = (uint8_t) rnd_b_cbor_sent;
+        report[10] = 0x5A; report[11] = 0x5B;
+        int before = mock_parse_calls;
+        send_report();
+        if (mock_parse_calls > before) {
+            rnd_b_cbor_admitted++; /* admission is synchronous */
+        }
+    }
+}
+
+/* One continuation report of a fragmented message (single-step variant of
+ * send_cbor_continuations). */
+static void rnd_send_cont(uint32_t cid, const uint8_t *payload, uint16_t len, uint16_t sent, uint8_t seq) {
+    uint16_t remain = (uint16_t) (len - sent);
+    memset(report, 0, sizeof(report));
+    put32(report, cid);
+    report[4] = seq;
+    size_t cn = remain < (HID_RPT_SIZE - 5) ? remain : (HID_RPT_SIZE - 5);
+    memcpy(report + 5, payload + sent, cn);
+    send_report();
+}
+
+/* The retry is delivered ATOMICALLY (all reports back-to-back, no pump in
+ * between - the pre-poll delivery ordering of the supported SET_REPORT
+ * control-transfer path, exactly like the deterministic scenes). Splitting
+ * the report stream with hid_task pumps in between would let the unwind's
+ * drop+replay admit a PARTIAL message mid-assembly, whose interleaving
+ * with the live continuation stream the oracle does not model; the
+ * report-level interleaving of a competing channel is covered
+ * deterministically by the competing_cid_during_unwind scene. */
+static void rnd_send_retry(const uint8_t *payload, uint16_t len) {
+    send_cbor_init_packet(CID, payload, len);
+    uint16_t sent = len < (HID_RPT_SIZE - 7) ? len : (HID_RPT_SIZE - 7);
+    uint8_t seq = 0;
+    while (sent < len) {
+        rnd_send_cont(CID, payload, len, sent, seq++);
+        sent = (uint16_t) (sent + (HID_RPT_SIZE - 5));
+    }
+}
+
+static bool rnd_quiescent(void) {
+    return !is_busy() && !is_req_button_pending() && !exec_finished_cancelled;
+}
+
+/* CBOR response frames present in the TX window (keepalive-cancel frames
+ * excluded). */
+static int rnd_count_responses(int tx_start) {
+    int n = 0;
+    for (int i = tx_start; i < tx_count; i++) {
+        const uint8_t *f = tx_frames[i];
+        if (f[4] == CTAPHID_CBOR && f[5] == 0 && !(f[6] == 1 && f[7] == CTAPHID_KEEPALIVE_CANCEL_STATUS)) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Full TX-window accounting for one iteration (see the block comment). */
+static void rnd_scan_window(int tx_start, int first_marker, int p_final, bool expect_02d) {
+    rnd_phase = "scan";
+    int marker = first_marker, k02d = 0, errors = 0;
+    for (int i = tx_start; i < tx_count; i++) {
+        const uint8_t *f = tx_frames[i];
+        if (f[4] == CTAPHID_CBOR && f[5] == 0) {
+            if (f[6] == 1 && f[7] == CTAPHID_KEEPALIVE_CANCEL_STATUS) {
+                k02d++;
+                RASSERT(frame_has_cid(f, CID));
+            }
+            else {
+                RASSERT(f[6] == 2 && f[7] == 0x00);
+                RASSERT(f[8] == marker); /* responses in parse order, no dup, no gap */
+                marker++;
+            }
+        }
+        else if (f[4] == CTAPHID_ERROR) {
+            errors++;
+            /* CHANNEL_BUSY only for the non-owning channel; the protected
+             * channel is never answered with an error. */
+            RASSERT(frame_has_cid(f, RND_CID_B));
+            RASSERT(f[6] == 1 && f[7] == CTAP1_ERR_CHANNEL_BUSY);
+        }
+        else if (f[4] == CTAPHID_INIT) {
+            int hit = -1;
+            if (rnd_have_resync_init && !rnd_resync_init_done && f[6] == 17 &&
+                memcmp(f + 7, rnd_resync_nonce, 8) == 0) {
+                hit = -2; /* the resync INIT's own response */
+            }
+            for (int k = 0; hit == -1 && k < rnd_b_inits; k++) {
+                if (!rnd_b_nonce_done[k] && f[6] == 17 && memcmp(f + 7, rnd_b_nonce[k], 8) == 0) {
+                    hit = k;
+                }
+            }
+            RASSERT(hit != -1); /* every INIT answered exactly once, nonce echoed */
+            if (hit == -2) {
+                rnd_resync_init_done = true;
+            }
+            else if (hit >= 0) {
+                rnd_b_nonce_done[hit] = true;
+            }
+        }
+        else if (f[4] == CTAPHID_PING) {
+            int hit = -1;
+            for (int k = 0; k < rnd_b_pings; k++) {
+                if (!rnd_b_ping_done[k] && f[6] == 4 && memcmp(f + 7, rnd_b_ping[k], 4) == 0) {
+                    hit = k;
+                }
+            }
+            RASSERT(hit >= 0); /* every PING echoed exactly once */
+            if (hit >= 0) {
+                rnd_b_ping_done[hit] = true;
+            }
+        }
+        else if (f[4] == CTAPHID_KEEPALIVE) {
+            /* legal: throttled processing keepalive of an admitted command */
+        }
+        else {
+            RASSERT(0); /* stale or unaccounted frame */
+        }
+    }
+    RASSERT(marker == p_final + 1);
+    RASSERT(k02d == (expect_02d ? 1 : 0));
+    /* Every request not seen above must have exactly one BUSY error. */
+    int echoed = 0;
+    for (int k = 0; k < rnd_b_pings; k++) {
+        echoed += rnd_b_ping_done[k] ? 1 : 0;
+    }
+    int inited = 0;
+    for (int k = 0; k < rnd_b_inits; k++) {
+        inited += rnd_b_nonce_done[k] ? 1 : 0;
+    }
+    RASSERT(inited == rnd_b_inits);
+    RASSERT(rnd_have_resync_init == rnd_resync_init_done);
+    RASSERT(errors == (rnd_b_pings - echoed) + (rnd_b_cbor_sent - rnd_b_cbor_admitted));
+}
+
+static void scene_randomized(uint64_t seed, int iterations) {
+    static const uint8_t old_payload[] = { 0x04, 0xaa };
+    static uint8_t retry_payload[CTAP_MAX_PACKET_SIZE];
+    static const uint8_t fresh_payload[] = { 0x04, 0x60 };
+    enum { MODE_CANCEL, MODE_PRESYNC, MODE_PRESS, MODE_RESYNC };
+
+    rnd_seed = seed;
+    rng_state = seed * 0x9E3779B97F4A7C15ULL + 0xD1B54A32D192ED03ULL;
+    printf("randomized: seed=0x%08llx iterations=%d\n", (unsigned long long) seed, iterations);
+    fflush(stdout);
+
+    write_btn("none");
+    write_btn("timeout:0");
+    channel_setup();
+
+    for (rnd_iter = 0; rnd_iter < iterations; rnd_iter++) {
+        uint32_t roll = rnd_below(100);
+        int mode = roll < 50 ? MODE_CANCEL : (roll < 65 ? MODE_PRESYNC : (roll < 85 ? MODE_PRESS : MODE_RESYNC));
+        bool press_wins = mode == MODE_CANCEL && rnd_below(100) < 30;
+
+        /* Retry of 1, 4 or 129 reports. Distinct payload per iteration. */
+        uint16_t retry_len;
+        uint32_t kind = rnd_below(3);
+        if (kind == 0) {
+            retry_len = 40; /* 1 report */
+        }
+        else if (kind == 1) {
+            retry_len = 200; /* init packet + 3 continuations */
+        }
+        else {
+            retry_len = CTAP_MAX_PACKET_SIZE; /* 129 reports */
+        }
+        for (uint16_t i = 0; i < retry_len; i++) {
+            retry_payload[i] = (uint8_t) (i * 13 + 5) ^ (uint8_t) (rnd_iter * 7 + 1);
+        }
+        int n_b = (int) rnd_below(4); /* 0..3 other-channel ops */
+
+        rnd_phase = "start";
+        rnd_steps = 0;
+        rnd_dbg_mode = mode;
+        rnd_dbg_kind = (int) kind;
+        rnd_dbg_nb = n_b;
+        rnd_dbg_press = press_wins ? 1 : 0;
+        /* Known button state for every iteration: a press left in the
+         * control file would complete the next wait before the cancel. */
+        write_btn("none");
+        write_btn("timeout:0");
+        rnd_reset_test_state();
+        RASSERT(rnd_quiescent());
+
+        int tx_start = tx_count;
+        bool expect_02d = mode != MODE_PRESS && mode != MODE_RESYNC;
+        int first_marker = (mode == MODE_PRESS) ? 1 : 2;
+
+        /* Old command with a pending UP wait. */
+        rnd_phase = "setup";
+        mock_up_push(true);
+        build_cbor(old_payload, sizeof(old_payload));
+        send_report();
+
+        if (mode != MODE_PRESYNC) {
+            rnd_phase = "wait";
+            bool pending = false;
+            for (int r = 0; r < 100 && !pending; r++) {
+                pending = is_req_button_pending();
+                if (!pending) {
+                    usleep(1000);
+                    hid_task();
+                    button_task();
+                    rnd_step();
+                }
+            }
+            RASSERT(pending);
+        }
+
+        if (mode == MODE_CANCEL || mode == MODE_PRESYNC) {
+            rnd_phase = "cancel";
+            build_cancel();
+            send_report();
+            rnd_pump_hid(2);
+            int cancel_resp = find_cbor_status_frame(CTAPHID_KEEPALIVE_CANCEL_STATUS, tx_start);
+            RASSERT(cancel_resp >= 0);
+            RASSERT(exec_finished_cancelled);
+
+            if (press_wins) {
+                /* The press races the cancellation delivery: the wait ends
+                 * PRESSED (emul answers the press before the armed cancel),
+                 * the cancelled transaction's completion is still dropped. */
+                write_btn("press");
+            }
+
+            /* Retry + other-channel ops inside the unwind window (hid_task
+             * only: the window stays open). No same-channel INIT here - a
+             * resync discards buffered reports by design (see block
+             * comment), so this scene never orphans them. */
+            rnd_phase = "retry";
+            mock_up_push(false);
+            rnd_send_retry(retry_payload, retry_len);
+            while (n_b > 0) {
+                rnd_b_op(rnd_pick_b_op(), (uint32_t) n_b);
+                n_b--;
+                if (rnd_below(2) == 0) {
+                    rnd_pump_hid(1);
+                }
+            }
+
+            /* Button polls: the unwind completes (press or cancellation). */
+            rnd_phase = "drain";
+            int p_final = 1 + 1 + rnd_b_cbor_admitted;
+            int want = p_final - first_marker + 1;
+            int r = 0;
+            for (; r < 200; r++) {
+                if (rnd_quiescent() && rnd_count_responses(tx_start) == want) {
+                    break;
+                }
+                usleep(1000);
+                hid_task();
+                button_task();
+                rnd_step();
+            }
+            RASSERT(rnd_quiescent() && rnd_count_responses(tx_start) == want);
+
+            rnd_pump_full(2);
+            RASSERT(rnd_quiescent());
+            RASSERT(worker_timed_out == 0);
+            RASSERT(worker_cancelled == (press_wins ? 0 : 1));
+            RASSERT(worker_pressed == (press_wins ? 1 : 0));
+            RASSERT(worker_cancel_parse_count == (press_wins ? -1 : 1)); /* only the old cmd was parsed at cancellation */
+            RASSERT(mock_parse_calls == p_final);
+            if (press_wins) {
+                write_btn("timeout:0"); /* clear the press for the next iteration */
+            }
+            /* The buffered retry was replayed whole and parsed exactly once. */
+            RASSERT(mock_parse_cmds[1] == CTAPHID_CBOR);
+            RASSERT(mock_parse_lens[1] == retry_len);
+            RASSERT(memcmp(mock_parse_payload[1], retry_payload, 8) == 0);
+            rnd_scan_window(tx_start, first_marker, p_final, expect_02d);
+        }
+        else if (mode == MODE_PRESS) {
+            /* Press completes the wait normally: one framed response, no
+             * 0x2D, no errors. Other-channel CBOR is excluded here: while
+             * the wait is active without a cancellation, an admitted
+             * second command's event is swallowed upstream (see block
+             * comment) - outside the cancel path's scope. */
+            rnd_phase = "ops";
+            while (n_b > 0) {
+                /* PING/INIT are always answered inline while the wait is
+                 * active; other-channel CBOR is excluded (block comment). */
+                rnd_b_op(rnd_below(100) < 50 ? RND_OP_PING : RND_OP_INIT, (uint32_t) n_b);
+                n_b--;
+                rnd_pump_hid(1);
+            }
+
+            rnd_phase = "press";
+            write_btn("press");
+            int p_final = 1;
+            int want = p_final - first_marker + 1;
+            int r = 0;
+            for (; r < 200; r++) {
+                if (rnd_quiescent() && rnd_count_responses(tx_start) == want) {
+                    break;
+                }
+                usleep(1000);
+                hid_task();
+                button_task();
+                rnd_step();
+            }
+            RASSERT(rnd_quiescent() && rnd_count_responses(tx_start) == want);
+
+            rnd_pump_full(2);
+            RASSERT(rnd_quiescent());
+            RASSERT(worker_pressed == 1 && worker_cancelled == 0 && worker_timed_out == 0);
+            RASSERT(worker_cancel_parse_count == -1);
+            RASSERT(mock_parse_calls == 1);
+            write_btn("timeout:0");
+            rnd_scan_window(tx_start, first_marker, p_final, false);
+        }
+        else { /* MODE_RESYNC */
+            /* INIT on the busy channel aborts the wait non-blockingly: the
+             * INIT response goes out, the cancellation is delivered on the
+             * normal path, no 0x2D is fabricated, and a fresh command on
+             * the resynced channel is answered exactly once. B ops are
+             * safe in both windows (PING/INIT answered inline; a CBOR
+             * inside the unwind window answered BUSY by the gate; a CBOR
+             * on an idle channel admitted and processed). */
+            rnd_phase = "ops";
+            while (n_b > 0) {
+                rnd_b_op(rnd_pick_b_op(), (uint32_t) n_b);
+                n_b--;
+                rnd_pump_hid(1);
+            }
+
+            rnd_phase = "resync";
+            static const uint8_t nonce[8] = { 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77 };
+            memcpy(rnd_resync_nonce, nonce, 8);
+            rnd_have_resync_init = true;
+            send_init_packet(CID, nonce);
+            rnd_pump_hid(2);
+            int init_resp = find_init_response(CID, nonce, tx_start);
+            RASSERT(init_resp >= 0);
+            RASSERT(find_cbor_status_frame(CTAPHID_KEEPALIVE_CANCEL_STATUS, tx_start) < 0);
+
+            rnd_phase = "unwind";
+            int r = 0;
+            for (; r < 200; r++) {
+                if (worker_cancelled == 1 && !exec_finished_cancelled) {
+                    break;
+                }
+                usleep(1000);
+                hid_task();
+                button_task();
+                rnd_step();
+            }
+            RASSERT(worker_cancelled == 1 && !exec_finished_cancelled);
+            RASSERT(worker_cancel_parse_count == 1);
+            RASSERT(worker_pressed == 0 && worker_timed_out == 0);
+
+            /* Fresh command on the resynced channel: admitted immediately
+             * now that the unwind completed (marker clear, worker free). */
+            mock_up_push(false);
+            build_cbor(fresh_payload, sizeof(fresh_payload));
+            send_report();
+            RASSERT(mock_parse_calls == 2);
+
+            rnd_phase = "drain";
+            int p_final = 2 + rnd_b_cbor_admitted;
+            int want = p_final - first_marker + 1;
+            for (r = 0; r < 200; r++) {
+                if (rnd_quiescent() && rnd_count_responses(tx_start) == want) {
+                    break;
+                }
+                usleep(1000);
+                hid_task();
+                button_task();
+                rnd_step();
+            }
+            RASSERT(rnd_quiescent() && rnd_count_responses(tx_start) == want);
+
+            rnd_pump_full(2);
+            RASSERT(rnd_quiescent());
+            RASSERT(mock_parse_calls == p_final);
+            RASSERT(mock_parse_cmds[1] == CTAPHID_CBOR);
+            RASSERT(mock_parse_payload[1][1] == 0x60);
+            rnd_scan_window(tx_start, first_marker, p_final, false);
+        }
+
+        /* No stale work anywhere: queues drained, state machine idle. */
+        RASSERT(usb_to_card_q.num_elem == 0 && card_to_usb_q.num_elem == 0);
+    }
+    printf("randomized: seed=0x%08llx all %d iterations passed\n", (unsigned long long) seed, iterations);
+    fflush(stdout);
+}
+
+/* Randomized-scene finding (seed 0x5EED0001, iteration 2): the CBOR
+ * response is built at completion time from ctap_req->cid and last_cmd
+ * (driver_exec_finished_cont_hid), but any inline traffic from another
+ * channel between admission and completion - a PING echo is always
+ * answerable - advances those globals. The completion is then delivered
+ * as a bogus frame addressed to the WRONG channel with the WRONG command
+ * byte, and the owning channel never receives its response. Deterministic
+ * repro: channel A's CBOR is admitted with a pending UP wait, channel B's
+ * one-report PING is echoed in between, then A's wait is pressed: the
+ * completion must be answered as A's CBOR response, and B must receive
+ * nothing but its PING echo. */
+static void scene_ping_echo_during_completion(void) {
+    static const uint8_t payload[] = { 0x04, 0xaa };
+    static const uint8_t ping_payload[] = { 0x50, 0x51, 0x52, 0x53 };
+
+    write_btn("none");
+    write_btn("timeout:0");
+    channel_setup();
+
+    mock_up_push(true);
+    build_cbor(payload, sizeof(payload));
+    send_report();
+    assert(spin_until(is_req_button_pending, 2000));
+
+    /* Legal competing-channel traffic while A's command is in flight. */
+    send_ping_packet(CID_B, ping_payload, sizeof(ping_payload));
+    for (unsigned waited = 0; waited < 2000 && find_ping_echo(CID_B, ping_payload, sizeof(ping_payload), 0) < 0; waited += 2) {
+        usleep(2000);
+        hid_task();
+        button_task();
+    }
+    assert(find_ping_echo(CID_B, ping_payload, sizeof(ping_payload), 0) >= 0);
+
+    /* A's wait completes normally: the response must be addressed to A. */
+    write_btn("press");
+    bool response_seen = false;
+    for (unsigned waited = 0; waited < 4000 && !response_seen; waited += 2) {
+        for (int i = 0; i < tx_count; i++) {
+            const uint8_t *f = tx_frames[i];
+            if (f[4] == CTAPHID_CBOR && f[5] == 0 && f[6] == 2 && f[7] == 0x00 && f[8] == 1 &&
+                frame_has_cid(f, CID)) {
+                response_seen = true;
+            }
+        }
+        if (!response_seen) {
+            usleep(2000);
+            hid_task();
+            button_task();
+        }
+    }
+    assert(response_seen);
+    assert(mock_parse_calls == 1);
+    assert(worker_pressed == 1 && worker_cancelled == 0 && worker_timed_out == 0);
+    /* B received nothing but its PING echo: no stale/corrupted frame. */
+    for (int i = 0; i < tx_count; i++) {
+        const uint8_t *f = tx_frames[i];
+        if (frame_has_cid(f, CID_B)) {
+            assert(f[4] == CTAPHID_PING && f[6] == (uint8_t) sizeof(ping_payload) &&
+                   memcmp(f + 7, ping_payload, sizeof(ping_payload)) == 0);
+        }
+    }
+    /* No PING-cmd frame carrying a 2-byte CBOR-shaped body (the corruption
+     * signature of a completion delivered with stale identity). */
+    for (int i = 0; i < tx_count; i++) {
+        const uint8_t *f = tx_frames[i];
+        assert(!(f[4] == CTAPHID_PING && f[6] == 2));
+    }
+    assert(!is_req_button_pending() && !is_busy());
+    printf("ping_echo_during_completion: a competing-channel PING echo between admission and "
+           "completion does not corrupt the response identity\n");
+}
+
 int main(int argc, char **argv) {
     assert(argc == 2);
     /* Hard step budget: a deadlock (e.g. a blocking handshake while a UP
@@ -1212,6 +1868,18 @@ int main(int argc, char **argv) {
     }
     else if (strcmp(argv[1], "init_during_active_wait") == 0) {
         scene_init_during_active_wait();
+    }
+    else if (strcmp(argv[1], "ping_echo_during_completion") == 0) {
+        scene_ping_echo_during_completion();
+    }
+    else if (strcmp(argv[1], "randomized_a") == 0) {
+        scene_randomized(0x5EED0001ull, 800);
+    }
+    else if (strcmp(argv[1], "randomized_b") == 0) {
+        scene_randomized(0x5EED0002ull, 800);
+    }
+    else if (strcmp(argv[1], "randomized_c") == 0) {
+        scene_randomized(0x5EED0003ull, 800);
     }
     else {
         return 2;
