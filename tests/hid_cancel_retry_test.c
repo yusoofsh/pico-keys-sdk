@@ -194,7 +194,15 @@ void *cbor_thread(void *arg) {
                 worker_timed_out++;
             }
         }
-        apdu.rdata[0] = (uint8_t) (worker_parse_index + 1);
+        /* Mirror the root's response contract: cbor_process stamps the
+         * status byte into the TX ring at admission and the handlers write
+         * their payload at completion time through res_APDU, which aliases
+         * ctap_resp->init.data + 1 (the ring as rebased by the last
+         * driver_init_hid). apdu.rdata is NOT part of that contract for
+         * CBOR: it is rebound per received packet, so a same-CID retry's
+         * response written through it would land one byte early whenever
+         * inline traffic (a PING echo) was processed in between. */
+        ctap_resp->init.data[1] = (uint8_t) (worker_parse_index + 1);
         apdu.rlen = 1;
         apdu.sw = 0;
         finished_data_size = apdu.rlen + 1;

@@ -67,6 +67,27 @@ uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t
 void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize);
 #endif
 
+/* Transaction state of the HID transport: IDLE (no command in flight),
+ * BUSY (a command is admitted to the worker; the TX ring holds its pending
+ * response data from the worker's completion write until the delivery) and
+ * UNWINDING (a CANCEL/INIT resync is aborting it). Response identity of the
+ * in-flight command, snapshotted when the command is admitted (handed to
+ * the worker). At completion time, legal inline traffic from other channels
+ * - a PING echo, an INIT allocation - has advanced ctap_req/last_cmd, so
+ * the completion must be addressed from the admission-time identity:
+ * building it from the current globals would deliver the response to the
+ * wrong channel with the wrong command byte, and the owning channel would
+ * never see its answer. */
+#define HID_TXN_IDLE      0u
+#define HID_TXN_BUSY      1u
+#define HID_TXN_UNWINDING 2u
+static uint8_t hid_txn_state = HID_TXN_IDLE;
+/* The channel of the BUSY/UNWINDING transaction; while unwinding it is the
+ * only channel whose reports the ring buffers. */
+static uint32_t hid_txn_cid = 0;
+static uint32_t resp_cid = 0;
+static uint8_t resp_cmd = 0;
+
 void hid_init(void) {
     if (ITF_HID_TOTAL == 0) {
         return;
@@ -106,20 +127,24 @@ int driver_init_hid(void) {
     apdu.header = ctap_req->init.data;
 
     ctap_resp = (CTAPHID_FRAME *) (hid_tx[ITF_HID_CTAP].buffer);
-    if (!is_busy()) {
-        /* A pending response owns apdu.rdata until its completion is
-         * delivered; a packet processed in between must not rebind it
-         * (see resp_data). */
-        apdu.rdata = ctap_resp->init.data;
-    }
-    memset(ctap_resp, 0, sizeof(CTAPHID_FRAME));
-
+    apdu.rdata = ctap_resp->init.data;
     usb_set_timeout_counter(ITF_HID, 200);
 
     is_nk = false;
 
-    hid_tx[ITF_HID_CTAP].w_ptr = hid_tx[ITF_HID_CTAP].r_ptr = 0;
-    send_buffer_size[ITF_HID_CTAP] = 0;
+    /* A received packet must not clobber a response that is in flight:
+     * inline traffic (another channel's PING echo or INIT allocation, and
+     * pre-admission error answers) is dispatched from this path while the
+     * TX ring holds the in-flight transaction's pending response data,
+     * which the worker writes at completion time. The CANCEL and
+     * INIT-resync handlers reset the ring themselves when they abort a
+     * transaction. hid_txn_sync() has already run for this packet, so the
+     * state is current. */
+    if (hid_txn_state != HID_TXN_BUSY) {
+        memset(ctap_resp, 0, sizeof(CTAPHID_FRAME));
+        hid_tx[ITF_HID_CTAP].w_ptr = hid_tx[ITF_HID_CTAP].r_ptr = 0;
+        send_buffer_size[ITF_HID_CTAP] = 0;
+    }
     return 0;
 }
 
@@ -362,26 +387,6 @@ static unsigned deferred_head = 0, deferred_tail = 0, deferred_count = 0;
 /* Transaction states, see the comment above the ring. */
 #define HID_TXN_IDLE       0u
 #define HID_TXN_BUSY       1u
-#define HID_TXN_UNWINDING  2u
-static uint8_t hid_txn_state = HID_TXN_IDLE;
-/* The channel of the BUSY/UNWINDING transaction; while unwinding it is the
- * only channel whose reports the ring buffers. */
-static uint32_t hid_txn_cid = 0;
-/* Response identity of the in-flight command, snapshotted when the command
- * is admitted (handed to the worker). At completion time, legal inline
- * traffic from other channels - a PING echo, an INIT allocation - has
- * advanced ctap_req/last_cmd, so the completion must be addressed from the
- * admission-time identity: building it from the current globals would
- * deliver the response to the wrong channel with the wrong command byte,
- * and the owning channel would never see its answer. */
-static uint32_t resp_cid = 0;
-static uint8_t resp_cmd = 0;
-/* Protected staging for the pending response's data (see resp_cid): the
- * worker writes through apdu.rdata into this buffer, and the completion
- * copies it into the TX ring - which inline traffic (another channel's PING
- * echo, the keepalive-cancel frame, driver_init_hid's per-packet rebinds)
- * may have overwritten in the meantime. */
-static uint8_t resp_data[CTAP_MAX_PACKET_SIZE];
 
 static void hid_deferred_flush(void) {
     deferred_head = deferred_tail = deferred_count = 0;
@@ -680,7 +685,13 @@ int driver_process_usb_packet_hid(uint16_t read) {
                 init_fido();
             }
             CTAPHID_INIT_REQ *req = (CTAPHID_INIT_REQ *) ctap_req->init.data;
-            CTAPHID_INIT_RESP *resp = (CTAPHID_INIT_RESP *) ctap_resp->init.data;
+            /* Inline answer in the tail frame (see send_keepalive): the
+             * allocation of another channel happens while a transaction
+             * may be in flight and must not overwrite the TX ring's
+             * pending response data. */
+            CTAPHID_FRAME *init_tx = (CTAPHID_FRAME *) (hid_tx[ITF_HID_CTAP].buffer + sizeof(hid_tx[ITF_HID_CTAP].buffer) - 64);
+            memset((uint8_t *) init_tx, 0, sizeof(CTAPHID_FRAME));
+            CTAPHID_INIT_RESP *resp = (CTAPHID_INIT_RESP *) init_tx->init.data;
             memcpy(resp->nonce, req->nonce, sizeof(resp->nonce));
             resp->cid = ctap_req->cid == CID_BROADCAST ? allocate_cid() : ctap_req->cid;
             resp->versionInterface = CTAPHID_IF_VERSION;
@@ -688,11 +699,11 @@ int driver_process_usb_packet_hid(uint16_t read) {
             resp->versionMinor = get_version_minor ? get_version_minor() : PICOKEYS_SDK_VERSION_MINOR;
             resp->capFlags = CAPFLAG_WINK | CAPFLAG_CBOR;
 
-            ctap_resp->cid = ctap_req->cid;
-            ctap_resp->init.cmd = CTAPHID_INIT;
-            ctap_resp->init.bcntl = 17;
-            ctap_resp->init.bcnth = 0;
-            driver_write_hid(ITF_HID_CTAP, CONST_BYTE_ARRAY((const uint8_t *)ctap_resp, 64));
+            init_tx->cid = ctap_req->cid;
+            init_tx->init.cmd = CTAPHID_INIT;
+            init_tx->init.bcntl = 17;
+            init_tx->init.bcnth = 0;
+            driver_write_hid(ITF_HID_CTAP, CONST_BYTE_ARRAY((const uint8_t *)init_tx, 64));
             msg_packet.len = msg_packet.current_len = 0;
             last_packet_time = 0;
         }
@@ -718,12 +729,17 @@ int driver_process_usb_packet_hid(uint16_t read) {
                 driver_exec_finished_hid(msg_packet.len);
             }
             else {
-                memcpy(ctap_resp->init.data, ctap_req->init.data, MSG_LEN(ctap_req));
-                ctap_resp->cid = ctap_req->cid;
-                ctap_resp->init.cmd = last_cmd;
-                ctap_resp->init.bcnth = MSG_LEN(ctap_req) >> 8;
-                ctap_resp->init.bcntl = MSG_LEN(ctap_req) & 0xff;
-                driver_write_hid(ITF_HID_CTAP, CONST_BYTE_ARRAY((const uint8_t *)ctap_resp, 64));
+                /* Inline echo in the tail frame (see send_keepalive): a
+                 * PING of another channel is answered while a transaction
+                 * may be in flight, and must not overwrite the TX ring's
+                 * pending response data. */
+                CTAPHID_FRAME *echo = (CTAPHID_FRAME *) (hid_tx[ITF_HID_CTAP].buffer + sizeof(hid_tx[ITF_HID_CTAP].buffer) - 64);
+                memcpy(echo->init.data, ctap_req->init.data, MSG_LEN(ctap_req));
+                echo->cid = ctap_req->cid;
+                echo->init.cmd = last_cmd;
+                echo->init.bcnth = MSG_LEN(ctap_req) >> 8;
+                echo->init.bcntl = MSG_LEN(ctap_req) & 0xff;
+                driver_write_hid(ITF_HID_CTAP, CONST_BYTE_ARRAY((const uint8_t *)echo, 64));
             }
             msg_packet.len = msg_packet.current_len = 0;
             last_packet_time = 0;
@@ -805,10 +821,6 @@ int driver_process_usb_packet_hid(uint16_t read) {
             else {
                 apdu_sent = apdu_process(ITF_HID_CTAP, CONST_BYTE_ARRAY(ctap_req->init.data, MSG_LEN(ctap_req)));
             }
-            /* See resp_data: the APDU worker's response bytes go to the
-             * protected staging too (is_nk's sw insert operates there). */
-            resp_data[0] = 0x00;
-            apdu.rdata = resp_data + 1;
             DEBUG_PAYLOAD(apdu.data, (int) apdu.nc);
             msg_packet.len = msg_packet.current_len = 0;
             last_packet_time = 0;
@@ -832,10 +844,6 @@ int driver_process_usb_packet_hid(uint16_t read) {
             else {
                 apdu_sent = cbor_process(last_cmd, ctap_req->init.data, MSG_LEN(ctap_req));
             }
-            /* See resp_data: point the worker's response bytes at the
-             * protected staging instead of the shared TX ring. */
-            resp_data[0] = 0x00;
-            apdu.rdata = resp_data + 1;
             msg_packet.len = msg_packet.current_len = 0;
             last_packet_time = 0;
             if (apdu_sent < 0) {
@@ -910,10 +918,6 @@ void driver_exec_finished_cont_hid(uint8_t itf, uint16_t size_next, uint16_t off
     ctap_resp->init.bcntl = size_next & 0xff;
     send_buffer_size[itf] = size_next;
     ctap_resp->init.cmd = resp_cmd;
-    /* The pending response's data was staged at admission (resp_data);
-     * copy it to the ring now, in case inline traffic overwrote the ring
-     * bytes while the command was in flight. */
-    memcpy(hid_tx[itf].buffer + offset + 7, resp_data, MIN(size_next, (uint16_t) sizeof(resp_data)));
     if (hid_write_offset(size_next+7, offset) > 0) {
         //ctap_resp = (CTAPHID_FRAME *) ((uint8_t *) ctap_resp + 64 - 5);
         //send_buffer_size[ITF_HID_CTAP] -= MIN(64 - 7, send_buffer_size[ITF_HID_CTAP]);
