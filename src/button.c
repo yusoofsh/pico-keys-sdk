@@ -19,6 +19,9 @@
 #include "button.h"
 #include "led/led.h"
 #include "pico_time.h"
+#if defined(ENABLE_EMULATION)
+#include "usb/emulation/button_emul.h"
+#endif
 #if defined(PICO_PLATFORM)
 #include "pico/multicore.h"
 #include "hardware/sync.h"
@@ -186,6 +189,69 @@ void button_wait_poll(void) {
 
 #endif
 
+#if defined(ENABLE_EMULATION)
+/*
+ * Emulated BOOT button waits. They mirror the firmware state machine, but
+ * the button state comes from the emulation control file (see
+ * usb/emulation/button_emul.h) instead of a GPIO. Auto mode (the default,
+ * and the mode when no control file exists) completes every wait
+ * immediately, exactly like the plain upstream emulation.
+ */
+static uint32_t emu_button_led_mode = MODE_MOUNTED;
+
+void button_wait_start(void) {
+    button_wait_start_timeout(button_timeout_seconds());
+}
+
+void button_wait_start_timeout(uint32_t timeout_seconds) {
+    uint32_t button_timeout = timeout_seconds * 1000;
+    if (emul_button_auto() || (button_timeout == 0 && !force_button_wait)) {
+        signal_emit(SIGNAL_USER_PRESENCE_COMPLETED);
+        uint32_t flag = EV_BUTTON_PRESSED;
+        queue_try_add(&usb_to_card_q, &flag);
+        return;
+    }
+    if (button_timeout == 0) {
+        /* FORCE_BUTTON_WAIT builds turn a configured timeout of 0 into a
+           nonzero wait, like the firmware path. */
+        button_timeout = 30000;
+    }
+    signal_user_presence_request_data_t data = {
+        .timeout = button_timeout / 1000,
+    };
+    signal_emit_param(SIGNAL_USER_PRESENCE_REQUEST, &data);
+    cancel_button = false;
+    emul_button_wait_start(button_timeout);
+    req_button_pending = true;
+    emu_button_led_mode = led_get_mode();
+    led_set_mode(MODE_BUTTON);
+}
+
+void button_wait_poll(void) {
+    button_event_t result = emul_button_wait_poll();
+    if (result == BUTTON_EV_NONE) {
+        return;
+    }
+    emul_button_wait_end();
+    req_button_pending = false;
+    led_set_mode(emu_button_led_mode);
+    uint32_t flag = 0;
+    if (result == BUTTON_EV_PRESSED) {
+        flag = EV_BUTTON_PRESSED;
+        signal_emit(SIGNAL_USER_PRESENCE_COMPLETED);
+    }
+    else if (result == BUTTON_EV_TIMEOUT) {
+        flag = EV_BUTTON_TIMEOUT;
+        signal_emit(SIGNAL_USER_PRESENCE_TIMEOUT);
+    }
+    else {
+        flag = EV_BUTTON_CANCELLED;
+        signal_emit(SIGNAL_USER_PRESENCE_CANCELLED);
+    }
+    queue_try_add(&usb_to_card_q, &flag);
+}
+#endif
+
 uint32_t button_timeout_seconds(void) {
     /* Disabled by default. As LED may not be properly configured,
        it will not be possible to indicate button press unless it
@@ -193,12 +259,19 @@ uint32_t button_timeout_seconds(void) {
 #ifndef ENABLE_EMULATION
     return phy_data.up_btn_present ? phy_data.up_btn : 0;
 #else
-    return 0;
+    /* Emulation-only timeout override (see usb/emulation/button_emul.h). */
+    return emul_button_timeout_seconds();
 #endif
 }
 
 void button_task(void) {
-#ifndef ENABLE_EMULATION
+#if defined(ENABLE_EMULATION)
+    /* Poll the control file and drive any active emulated wait. */
+    emul_button_task();
+    if (emul_button_wait_active()) {
+        button_wait_poll();
+    }
+#else
     uint32_t now = board_millis();
     if (now > 1000 && now - button_last_poll >= 10 && (async_button_wait || !is_busy())) { // wait 1 second to boot up
 #ifdef PICO_PLATFORM

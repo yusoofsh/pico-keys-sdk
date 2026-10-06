@@ -351,11 +351,11 @@ int card_status(uint8_t itf) {
                 }
                 return PICOKEYS_OK;
             }
-#ifndef ENABLE_EMULATION
             else if ((m & 0xffu) == EV_PRESS_BUTTON) {
+                // Dispatched in emulation builds too, where the emulated
+                // button (usb/emulation/button_emul.h) answers the wait.
                 button_wait_start_timeout(EV_PRESS_BUTTON_GET_TIMEOUT(m));
             }
-#endif
 #ifdef PICO_PLATFORM
             else if (m == EV_RESET) {
                 usb_secure_reboot_now();
