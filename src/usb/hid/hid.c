@@ -56,6 +56,7 @@ static write_status_t *last_write_result = NULL;
 
 CTAPHID_FRAME *ctap_req = NULL, *ctap_resp = NULL;
 static void send_keepalive(void);
+static int ctap_error_cid(uint32_t cid, uint8_t error);
 int driver_process_usb_packet_hid(uint16_t read);
 int driver_write_hid(uint8_t itf, const_byte_array_t buffer);
 static int driver_process_usb_nopacket_hid(void);
@@ -288,7 +289,15 @@ int (*hid_set_report_cb)(uint8_t, uint8_t, hid_report_type_t, uint8_t const *, u
 // Invoked when received SET_REPORT control request or
 // received data on OUT endpoint ( Report ID = 0, Type = 0 )
 
-/* Deferred packets while a cancelled CBOR transaction is unwinding.
+/* HID-side CTAPHID transaction state machine and the cancellation unwind.
+ *
+ * States: IDLE (no transaction), BUSY(cid) (a worker command of channel
+ * `cid` was admitted, its response timeout armed), UNWINDING(cid) (the
+ * transaction was aborted - by CTAPHID_CANCEL or by a same-channel
+ * CTAPHID_INIT resync - and is being torn down). hid_txn_sync() keeps the
+ * state in step with the transport signals: the response timeout
+ * disarming ends BUSY, the exec_finished_cancelled marker being consumed
+ * ends UNWINDING.
  *
  * CTAPHID_CANCEL stops the response timeout and marks the aborted
  * transaction (exec_finished_cancelled), but the old UP wait is only
@@ -297,25 +306,38 @@ int (*hid_set_report_cb)(uint8_t, uint8_t, hid_report_type_t, uint8_t const *, u
  * enqueues EV_CMD_AVAILABLE without awaiting acknowledgement, and the
  * still-pending wait (pico-fido fido.c wait_button_pressed loop) removes
  * and discards every non-button event - the new request would never be
- * processed. While the marker is set, arriving packets are buffered here
- * and replayed from hid_task() once the cancellation has been delivered
- * and the aborted transaction's late completion has been consumed and
- * dropped by card_status(). CANCEL and INIT pass through: CANCEL is
- * harmless while unwinding, and INIT is the resync path whose card_exit()
- * drains the queues and clears the marker (the buffered packets are
- * dropped with the dead session).
+ * processed. While the marker is set, arriving packets are therefore
+ * buffered in the ring below and replayed from hid_task() once the
+ * cancellation has been delivered and the aborted transaction's late
+ * completion has been consumed and dropped by card_status().
  *
- * The ring must not drop anything during the unwind, so it is sized for
- * ONE complete maximum-size CTAPHID message: the transport reassembles up
- * to CTAP_MAX_PACKET_SIZE payload bytes (one init packet plus 128
- * continuations, ctap_hid.h), and the host is free to send all of those
- * reports inside the window because SET_REPORT control transfers bypass
- * the interrupt endpoint's 10 ms pacing. makeCredential retries are
- * commonly several reports. A packet that does not fit - a second message
- * or an interleaved channel - is answered with CTAP1_ERR_CHANNEL_BUSY
- * instead of being dropped silently.
+ * The ring belongs to the UNWINDING channel only. It is sized for ONE
+ * complete maximum-size CTAPHID message of that channel (one init packet
+ * plus 128 continuations, ctap_hid.h; makeCredential retries are commonly
+ * several reports), and a report of any other channel is answered with
+ * CTAP1_ERR_CHANNEL_BUSY immediately, without consuming a ring slot or
+ * disturbing the buffered message. A report that does not fit - a second
+ * message on the unwinding channel - is answered the same way instead of
+ * being dropped silently.
  *
- * Sizing the ring was chosen over the two alternatives:
+ * CTAPHID_INIT resynchronization must never block on the worker: the UP
+ * wait removes and discards every non-button event, so card_exit()'s
+ * blocking EV_EXIT handshake would never be acknowledged while a wait is
+ * active (or committed to start) and core0 would deadlock. On the BUSY or
+ * UNWINDING channel, INIT therefore aborts non-blockingly: the buffered
+ * reports of the dead session are discarded, the cancellation is armed for
+ * the active wait (cancel_button; the marker is also set when no
+ * CTAPHID_CANCEL was seen, so the abort's late completion is dropped and
+ * the admission gate stays closed until the unwind completes), and the
+ * INIT response is written immediately. The unwind then completes on the
+ * normal paths - button_task delivers the cancellation, card_status()
+ * drops the late completion. INIT of a different channel only allocates
+ * that channel and touches neither the in-flight transaction, the unwind
+ * nor the ring. Only in IDLE does INIT run the classic card_exit()
+ * teardown.
+ *
+ * Sizing the ring per protected message was chosen over the two
+ * alternatives:
  * - Non-dropping backpressure (leaving the OUT endpoint un-armed so the
  *   host NAKs, or not reading the emulation socket) cannot be applied
  *   here without modifying third-party code: the control SET_REPORT data
@@ -332,20 +354,41 @@ int (*hid_set_report_cb)(uint8_t, uint8_t, hid_report_type_t, uint8_t const *, u
 static uint8_t deferred_reports[HID_DEFERRED_MAX][HID_RPT_SIZE];
 static unsigned deferred_head = 0, deferred_tail = 0, deferred_count = 0;
 
+/* Transaction states, see the comment above the ring. */
+#define HID_TXN_IDLE       0u
+#define HID_TXN_BUSY       1u
+#define HID_TXN_UNWINDING  2u
+static uint8_t hid_txn_state = HID_TXN_IDLE;
+/* The channel of the BUSY/UNWINDING transaction; while unwinding it is the
+ * only channel whose reports the ring buffers. */
+static uint32_t hid_txn_cid = 0;
+
 static void hid_deferred_flush(void) {
     deferred_head = deferred_tail = deferred_count = 0;
 }
 
-static bool hid_admission_deferred(const uint8_t *report) {
-    if (!exec_finished_cancelled) {
-        return false;
+static void hid_txn_sync(void) {
+    if (hid_txn_state == HID_TXN_BUSY && !is_busy()) {
+        hid_txn_state = HID_TXN_IDLE;
     }
-    CTAPHID_FRAME const *frame = (CTAPHID_FRAME const *) report;
-    if (FRAME_TYPE(frame) == TYPE_INIT &&
-        (frame->init.cmd == CTAPHID_CANCEL || frame->init.cmd == CTAPHID_INIT)) {
-        return false;
+    else if (hid_txn_state == HID_TXN_UNWINDING && !exec_finished_cancelled) {
+        hid_txn_state = HID_TXN_IDLE;
+        hid_txn_cid = 0;
     }
-    return true;
+}
+
+static void hid_txn_start(uint32_t cid) {
+    hid_txn_state = HID_TXN_BUSY;
+    hid_txn_cid = cid;
+}
+
+/* Record the unwind of transaction `cid`. The caller arms the
+ * cancellation: cancel_button for the wait, the exec_finished_cancelled
+ * marker for the late completion and the admission gate, timeout_stop()
+ * for the response timeout. */
+static void hid_txn_unwind_begin(uint32_t cid) {
+    hid_txn_state = HID_TXN_UNWINDING;
+    hid_txn_cid = cid;
 }
 
 void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize) {
@@ -360,19 +403,39 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
             if (bufsize != HID_RPT_SIZE) {
                 return;
             }
-            if (hid_admission_deferred(buffer)) {
-                if (deferred_count == HID_DEFERRED_MAX) {
-                    /* Does not fit - by construction this is a second
-                     * message or an interleaved channel (one complete
-                     * maximum-size message always fits): answer honestly
-                     * instead of dropping silently. */
-                    ctap_error(CTAP1_ERR_CHANNEL_BUSY);
+            if (exec_finished_cancelled) {
+                /* Unwind window: the ring belongs to the unwinding channel
+                 * (hid_txn_cid), see the comment above the ring. */
+                CTAPHID_FRAME const *frame = (CTAPHID_FRAME const *) buffer;
+                if (FRAME_TYPE(frame) == TYPE_INIT &&
+                    (frame->init.cmd == CTAPHID_CANCEL || frame->init.cmd == CTAPHID_INIT)) {
+                    /* CANCEL is harmless while unwinding and INIT is the
+                     * resync path: both are handled by the normal dispatch
+                     * below and never touch the ring. */
+                }
+                else if (frame->cid != hid_txn_cid) {
+                    /* A competing channel must not consume the capacity
+                     * reserved for the protected retry: answer it without
+                     * buffering and without disturbing the buffered
+                     * message. The raw frame's CID is used because ctap_req
+                     * still holds the last processed report here. */
+                    ctap_error_cid(frame->cid, CTAP1_ERR_CHANNEL_BUSY);
                     return;
                 }
-                memcpy(deferred_reports[deferred_head], buffer, HID_RPT_SIZE);
-                deferred_head = (deferred_head + 1) % HID_DEFERRED_MAX;
-                deferred_count++;
-                return;
+                else if (deferred_count == HID_DEFERRED_MAX) {
+                    /* By construction one complete maximum-size message of
+                     * the unwinding channel always fits; a full ring is a
+                     * second message on that channel. Answer instead of
+                     * dropping silently. */
+                    ctap_error_cid(frame->cid, CTAP1_ERR_CHANNEL_BUSY);
+                    return;
+                }
+                else {
+                    memcpy(deferred_reports[deferred_head], buffer, HID_RPT_SIZE);
+                    deferred_head = (deferred_head + 1) % HID_DEFERRED_MAX;
+                    deferred_count++;
+                    return;
+                }
             }
             memcpy(hid_rx[itf].buffer + hid_rx[itf].w_ptr, buffer, bufsize);
             hid_rx[itf].w_ptr += bufsize;
@@ -385,15 +448,22 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
 }
 
 uint32_t last_cmd_time = 0, last_packet_time = 0;
-int ctap_error(uint8_t error) {
+/* CTAPHID_ERROR with an explicit channel: the admission gate answers raw
+ * reports before they are copied into ctap_req, so the stale ctap_req->cid
+ * must not be used there. */
+static int ctap_error_cid(uint32_t cid, uint8_t error) {
     memset((uint8_t *)ctap_resp, 0, sizeof(CTAPHID_FRAME));
-    ctap_resp->cid = ctap_req->cid;
+    ctap_resp->cid = cid;
     ctap_resp->init.cmd = CTAPHID_ERROR;
     ctap_resp->init.bcntl = 1;
     ctap_resp->init.data[0] = error;
     hid_write(64);
     last_packet_time = 0;
     return 0;
+}
+
+int ctap_error(uint8_t error) {
+    return ctap_error_cid(ctap_req->cid, error);
 }
 
 uint8_t last_cmd = 0;
@@ -436,6 +506,7 @@ uint16_t *get_send_buffer_size(uint8_t itf) {
 
 int driver_process_usb_packet_hid(uint16_t read) {
     int apdu_sent = 0;
+    hid_txn_sync();
     if (read == HID_RPT_SIZE) {
         driver_init_hid();
 
@@ -480,6 +551,7 @@ int driver_process_usb_packet_hid(uint16_t read) {
                  * its own EV_EXEC_FINISHED afterwards. card_status() drops
                  * that late completion instead of delivering its frame. */
                 exec_finished_cancelled = true;
+                hid_txn_unwind_begin(ctap_req->cid);
             }
             return 0;
         }
@@ -525,12 +597,50 @@ int driver_process_usb_packet_hid(uint16_t read) {
             }
         }
         if (ctap_req->init.cmd == CTAPHID_INIT) {
-            card_exit();
-            /* The resync dropped the aborted session: buffered packets
-             * belong to it and are discarded with the drained queues. */
-            hid_deferred_flush();
-            hid_tx[ITF_HID_CTAP].r_ptr = hid_tx[ITF_HID_CTAP].w_ptr = 0;
-            init_fido();
+            hid_txn_sync();
+            bool resync_owner = false;
+            if (hid_txn_state == HID_TXN_IDLE) {
+                card_exit();
+                /* The resync dropped the aborted session: buffered packets
+                 * belong to it and are discarded with the drained queues. */
+                hid_deferred_flush();
+                resync_owner = true;
+            }
+            else if (ctap_req->cid == hid_txn_cid) {
+                /* Non-blocking abort of this channel's transaction (see the
+                 * comment above the ring): the UP wait - active or about to
+                 * start - discards every non-button event, so the blocking
+                 * EV_EXIT handshake of card_exit() would deadlock core0.
+                 * Arm the cancellation for the wait, mark the transaction's
+                 * late completion for dropping (also when no CTAPHID_CANCEL
+                 * was seen), discard the now-obsolete buffered reports and
+                 * answer INIT immediately; the unwind completes on the
+                 * normal paths (button_task delivers the cancellation,
+                 * card_status() drops the late completion). */
+                cancel_button = true;
+                timeout_stop();
+                if (!exec_finished_cancelled) {
+                    exec_finished_cancelled = true;
+                }
+                hid_txn_unwind_begin(ctap_req->cid);
+                hid_deferred_flush();
+                send_buffer_size[ITF_HID_CTAP] = 0;
+                /* A report of the aborted session may still be in flight on
+                 * the USB stack; its completion callback would otherwise
+                 * advance the reset ring and swallow the INIT response
+                 * written below. Invalidate the write credit so the stale
+                 * completion is ignored. */
+                last_write_result[ITF_HID_CTAP] = WRITE_FAILED;
+                resync_owner = true;
+            }
+            /* else: an INIT of a different channel while a transaction of
+             * hid_txn_cid is in flight only allocates that channel - it is
+             * answered below without the blocking handshake and without
+             * touching the transaction, the unwind or the ring. */
+            if (resync_owner) {
+                hid_tx[ITF_HID_CTAP].r_ptr = hid_tx[ITF_HID_CTAP].w_ptr = 0;
+                init_fido();
+            }
             CTAPHID_INIT_REQ *req = (CTAPHID_INIT_REQ *) ctap_req->init.data;
             CTAPHID_INIT_RESP *resp = (CTAPHID_INIT_RESP *) ctap_resp->init.data;
             memcpy(resp->nonce, req->nonce, sizeof(resp->nonce));
@@ -698,6 +808,7 @@ int driver_process_usb_packet_hid(uint16_t read) {
                 card_start(ITF_HID, cbor_thread);
             }
             usb_send_event(EV_CMD_AVAILABLE);
+            hid_txn_start(ctap_req->cid);
         }
     }
     return apdu_sent;
@@ -790,8 +901,9 @@ void hid_task(void) {
      * replayed once the marker cleared: the cancellation has been delivered
      * and the late completion consumed, so the replay's EV_CMD_AVAILABLE
      * can only be consumed by the worker's command loop. The ring held one
-     * complete maximum-size message, so the replay never reassembles a
-     * partial one. */
+     * complete maximum-size message of the unwinding channel, so the replay
+     * never reassembles a partial one. */
+    hid_txn_sync();
     if (!exec_finished_cancelled && deferred_count > 0) {
         uint8_t replay[HID_RPT_SIZE];
         while (deferred_count > 0 && !exec_finished_cancelled) {
