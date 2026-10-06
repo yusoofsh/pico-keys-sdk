@@ -37,6 +37,9 @@
 
 mock_phy_t phy_data;
 queue_t usb_to_card_q, card_to_usb_q;
+/* usb.c is not linked here; the harness drives the marker itself to model a
+ * CTAPHID_CANCEL that is still unwinding (see button_wait_start_timeout). */
+volatile bool exec_finished_cancelled = false;
 static mock_ioqspi_t qspi_registers;
 static mock_sio_t sio_registers;
 mock_ioqspi_t *ioqspi_hw = &qspi_registers;
@@ -160,6 +163,37 @@ int main(int argc, char **argv) {
         expect_last(EV_BUTTON_PRESSED);
         assert(completed == 1);
         printf("timedout_hold: request A timed out (EV_BUTTON_TIMEOUT=%u); its held press did not authorize B; a fresh press/release did\n", EV_BUTTON_TIMEOUT);
+    } else if (strcmp(argv[1], "cancel_before_start") == 0) {
+        /* CTAPHID_CANCEL arrived while the transaction's UP wait had not
+         * started yet (its EV_PRESS_BUTTON was still queued): starting the
+         * wait must deliver the pending cancellation immediately, not
+         * discard it and run a full wait on a cancelled request. */
+        level(false);
+        cancel_button = true;
+        exec_finished_cancelled = true;
+        button_wait_start();
+        expect_last(EV_BUTTON_CANCELLED);
+        assert(cancel_button == false);
+        assert(cancelled == 1 && completed == 0);
+        printf("cancel_before_start: a cancel pending at wait start is delivered (EV_BUTTON_CANCELLED=%u), not discarded\n", EV_BUTTON_CANCELLED);
+    } else if (strcmp(argv[1], "cancel_stale_discard") == 0) {
+        /* Control: a cancel left over from an EARLIER transaction (nothing
+         * is unwinding) is still discarded at wait start; the wait then
+         * completes only on a fresh press/release. */
+        level(false);
+        cancel_button = true;
+        exec_finished_cancelled = false;
+        button_wait_start();
+        assert(is_req_button_pending());
+        assert(cancel_button == false);
+        assert(usb_to_card_q.count == 0);
+        now_ms = 2100;
+        tick(2110, true); /* fresh press begun after the wait started */
+        expect_no_new_event();
+        tick(2120, false);
+        expect_last(EV_BUTTON_PRESSED);
+        assert(completed == 1 && cancelled == 0);
+        printf("cancel_stale_discard: a stale cancel is discarded at wait start; a fresh press/release completed\n");
     } else if (strcmp(argv[1], "fresh_press") == 0) {
         level(false);
         button_wait_start();

@@ -138,8 +138,43 @@ else()
         -Wall -Wextra -Werror
     )
 endif()
-foreach(scene IN ITEMS preheld cancelled_hold timedout_hold fresh_press no_touch)
+foreach(scene IN ITEMS preheld cancelled_hold timedout_hold cancel_before_start cancel_stale_discard fresh_press no_touch)
     add_test(NAME button_held_${scene} COMMAND button_held_test ${scene})
+endforeach()
+
+# --- CTAPHID_CANCEL fast same-channel retry harness ---------------------------
+# Compiles the UNMODIFIED production transport (src/usb/hid/hid.c,
+# src/usb/usb.c), the emulated-button path of src/button.c and
+# src/usb/emulation/button_emul.c on the host with ENABLE_EMULATION +
+# FORCE_BUTTON_WAIT, and models the CBOR worker (core1) with the exact queue
+# protocol of cbor_thread (src/cbor.c) and the UP wait
+# (pico-fido src/fido/fido.c: remove events until a button event arrives,
+# discarding anything else). One scenario per process: the fast retry that
+# arrives before the next 10 ms button poll (the race), the settled retry,
+# the no-retry no-stale control and a fresh-press control.
+add_executable(hid_cancel_retry_test
+    ${CMAKE_CURRENT_LIST_DIR}/../src/usb/hid/hid.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/usb/usb.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/button.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/usb/emulation/button_emul.c
+    ${CMAKE_CURRENT_LIST_DIR}/hid_cancel_retry_test.c
+)
+target_compile_definitions(hid_cancel_retry_test PRIVATE ENABLE_EMULATION USB_ITF_HID=1 USB_ITF_CCID=1 FORCE_BUTTON_WAIT)
+target_include_directories(hid_cancel_retry_test PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../src
+    ${CMAKE_CURRENT_LIST_DIR}/../src/fs
+    ${CMAKE_CURRENT_LIST_DIR}/../src/usb
+    ${CMAKE_CURRENT_LIST_DIR}/../src/usb/hid
+    ${CMAKE_CURRENT_LIST_DIR}/../src/usb/emulation
+)
+if(MSVC)
+    message(FATAL_ERROR "the cancel-retry harness uses GCC-style host builds only")
+else()
+    target_compile_options(hid_cancel_retry_test PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(hid_cancel_retry_test PRIVATE pthread)
+endif()
+foreach(scene IN ITEMS fast_retry settled_retry no_retry_after_cancel press_control)
+    add_test(NAME hid_cancel_retry_${scene} COMMAND hid_cancel_retry_test ${scene})
 endforeach()
 
 add_executable(flash_layout_test
