@@ -126,6 +126,9 @@ static volatile bool mock_up_flags[8];
 static int mock_up_flag_tail = 0;          /* test side (per admission) */
 static volatile int mock_up_flag_head = 0; /* worker side (per parse) */
 static int worker_up_waits = 0, worker_pressed = 0, worker_cancelled = 0, worker_timed_out = 0;
+/* Snapshot of mock_parse_calls taken by the worker thread at the moment it
+ * observes the cancellation: the retry must not have been parsed by then. */
+static volatile int worker_cancel_parse_count = -1;
 static volatile int worker_parse_index = 0;
 
 static void mock_up_push(bool required) {
@@ -179,6 +182,7 @@ void *cbor_thread(void *arg) {
             }
             else if (val == EV_BUTTON_CANCELLED) {
                 worker_cancelled++;
+                worker_cancel_parse_count = mock_parse_calls;
             }
             else {
                 worker_timed_out++;
@@ -408,6 +412,81 @@ static void scene_fast_retry(void) {
            "answered exactly once with a correctly framed response\n");
 }
 
+/* The cancel arrives right after the admission keepalive, BEFORE the UP
+ * wait has started (its EV_PRESS_BUTTON is still queued): the wait start
+ * must deliver the pending cancellation, and the retry must still be
+ * answered exactly once. */
+static bool retry_parsed(void) {
+    return mock_parse_calls == 2;
+}
+
+static void scene_cancel_before_wait_start(void) {
+    static const uint8_t old_payload[] = { 0x04, 0xaa };
+    static const uint8_t retry_payload[] = { 0x04, 0xbb };
+
+    write_btn("none");
+    write_btn("timeout:0");
+    /* Process the control file now: without this the emulated button is
+     * still in auto mode and the wait would complete without ever running. */
+    button_task();
+    channel_setup();
+
+    mock_up_push(true);
+    build_cbor(old_payload, sizeof(old_payload));
+    send_report();
+    /* No pump and no settle before the cancel: whatever the worker has
+     * done by now, its EV_PRESS_BUTTON can only be consumed after the
+     * cancel is marked, i.e. inside the pre-start window. */
+    build_cancel();
+    send_report();
+    pump_hid(6);
+    int cancel_resp = find_cbor_status_frame(CTAPHID_KEEPALIVE_CANCEL_STATUS, 1);
+    assert(cancel_resp > 0);
+
+    mock_up_push(false);
+    build_cbor(retry_payload, sizeof(retry_payload));
+    send_report();
+    usleep(30000);
+    hid_task();
+    button_task();
+
+    /* The retry may only be admitted once the cancelled wait has observed
+     * its cancellation: the worker's snapshot of the parse count taken when
+     * its wait loop returned must still show only the cancelled command. */
+    assert(spin_until(worker_saw_cancel, 2000));
+    assert(worker_cancel_parse_count == 1);
+    assert(spin_until(retry_parsed, 2000));
+
+    static const uint8_t retry_marker = 2;
+    bool retry_response_seen = false;
+    for (unsigned waited = 0; waited < 2000 && !retry_response_seen; waited += 2) {
+        for (int i = cancel_resp + 1; i < tx_count; i++) {
+            const uint8_t *f = tx_frames[i];
+            if (f[4] == CTAPHID_CBOR && f[5] == 0 && f[6] == 2 && f[7] == 0x00 && f[8] == retry_marker) {
+                retry_response_seen = true;
+            }
+        }
+        if (!retry_response_seen) {
+            usleep(2000);
+            hid_task();
+            button_task();
+        }
+    }
+    assert(retry_response_seen);
+    assert(worker_cancelled == 1);
+    assert(old_completion_dropped);
+    int stray = -1;
+    for (int i = cancel_resp + 1; i < tx_count; i++) {
+        const uint8_t *f = tx_frames[i];
+        if (f[4] == CTAPHID_CBOR && f[5] == 0) {
+            assert(stray < 0);
+            stray = i;
+        }
+    }
+    assert(stray > 0);
+    printf("cancel_before_wait_start: a cancel during the pre-start window cancels the wait; the retry is admitted only after the unwind and answered exactly once\n");
+}
+
 /* Settled control: pumps run between the cancel and the retry (the ordering
  * test_cancel_same_channel.py covers end to end). Must keep working. */
 static void scene_settled_retry(void) {
@@ -554,6 +633,9 @@ int main(int argc, char **argv) {
     usb_init();
     if (strcmp(argv[1], "fast_retry") == 0) {
         scene_fast_retry();
+    }
+    else if (strcmp(argv[1], "cancel_before_wait_start") == 0) {
+        scene_cancel_before_wait_start();
     }
     else if (strcmp(argv[1], "settled_retry") == 0) {
         scene_settled_retry();

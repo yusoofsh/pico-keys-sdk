@@ -173,7 +173,7 @@ else()
     target_compile_options(hid_cancel_retry_test PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(hid_cancel_retry_test PRIVATE pthread)
 endif()
-foreach(scene IN ITEMS fast_retry settled_retry no_retry_after_cancel press_control)
+foreach(scene IN ITEMS fast_retry cancel_before_wait_start settled_retry no_retry_after_cancel press_control)
     add_test(NAME hid_cancel_retry_${scene} COMMAND hid_cancel_retry_test ${scene})
 endforeach()
 
