@@ -201,6 +201,32 @@ static void test_press_after_discarded_without_wait(void) {
     env_teardown();
 }
 
+static void test_press_after_boundary_no_idle_poll(void) {
+    env_setup();
+    write_btn("none");
+    write_btn("timeout:0");
+    write_btn("press-after:80");
+    /* Advance past the press deadline WITHOUT any idle poll: neither
+     * emul_button_task nor a wait poll may run in between, so the command
+     * is still pending when the wait activates. */
+    uint32_t written = board_millis();
+    while (board_millis() - written < 150) {
+        msleep_test(5);
+    }
+    /* The press fired while no wait was active: it belongs to no request
+     * and must never authorize this wait (the no-stale rule), even though
+     * no idle poll discarded it. */
+    emul_button_wait_start(400);
+    assert(poll_until(2000) == BUTTON_EV_TIMEOUT);
+    emul_button_wait_end();
+    /* A fresh press written while the next wait runs still succeeds. */
+    write_btn("press-after:100");
+    emul_button_wait_start(3000);
+    assert(poll_until(2000) == BUTTON_EV_PRESSED);
+    emul_button_wait_end();
+    env_teardown();
+}
+
 static void test_cancel_aborts_only_the_active_wait(void) {
     env_setup();
     write_btn("none");
@@ -270,6 +296,7 @@ int main(void) {
     test_press_delivered_once_after_wait_starts();
     test_press_after_delivered_while_waiting();
     test_press_after_discarded_without_wait();
+    test_press_after_boundary_no_idle_poll();
     test_cancel_aborts_only_the_active_wait();
     test_none_never_presses();
     test_absent_file_keeps_last_mode();

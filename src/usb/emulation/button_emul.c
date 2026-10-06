@@ -290,9 +290,18 @@ button_event_t emul_button_wait_poll(void) {
         cmd_consumed = true; /* consumed by exactly one wait */
         return BUTTON_EV_PRESSED;
     }
-    if (!cmd_consumed && current_cmd == EMUL_BTN_PRESS_AFTER && (int32_t) (now - press_due_ms) >= 0) {
-        cmd_consumed = true; /* delivered: a wait is active */
-        return BUTTON_EV_PRESSED;
+    if (!cmd_consumed && current_cmd == EMUL_BTN_PRESS_AFTER) {
+        if ((int32_t) (press_due_ms - wait_started_ms) < 0) {
+            /* The press fired before this wait started: no wait was active
+             * at that moment (or it belonged to a previous request).
+             * Discard it even when no idle poll ran in between, so a press
+             * that precedes a request never authorizes it (no-stale rule). */
+            cmd_consumed = true;
+        }
+        else if ((int32_t) (now - press_due_ms) >= 0) {
+            cmd_consumed = true; /* delivered: a wait is active */
+            return BUTTON_EV_PRESSED;
+        }
     }
     if (!cmd_consumed && current_cmd == EMUL_BTN_CANCEL) {
         cmd_consumed = true;
