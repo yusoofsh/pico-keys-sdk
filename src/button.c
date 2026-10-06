@@ -133,7 +133,13 @@ void button_wait_start_timeout(uint32_t timeout_seconds) {
         .timeout = button_timeout / 1000,
     };
     signal_emit_param(SIGNAL_USER_PRESENCE_REQUEST, &data);
-    cancel_button = false;
+    /* A cancel still marked on a cancelled transaction (see
+     * exec_finished_cancelled) belongs to THIS wait: keep it so the poll
+     * delivers it below. Otherwise it is stale from an earlier transaction
+     * and is discarded here. */
+    if (!exec_finished_cancelled) {
+        cancel_button = false;
+    }
     async_button_wait = true;
     /* Only a fresh press that begins after this wait counts. A level already
      * held (a press that started before the request, or one carried over
@@ -146,6 +152,15 @@ void button_wait_start_timeout(uint32_t timeout_seconds) {
     async_button_led_mode = led_get_mode();
     req_button_pending = true;
     led_set_mode(MODE_BUTTON);
+    if (exec_finished_cancelled && cancel_button) {
+        /* CTAPHID_CANCEL arrived while this transaction's UP wait had not
+         * started yet (its EV_PRESS_BUTTON was still queued). Start the
+         * wait and deliver the cancellation immediately instead of running
+         * the wait as if nothing had happened. The flag's job is done once
+         * the wait observed it. */
+        button_wait_poll();
+        cancel_button = false;
+    }
 }
 
 void button_wait_poll(void) {
@@ -235,11 +250,21 @@ void button_wait_start_timeout(uint32_t timeout_seconds) {
         .timeout = button_timeout / 1000,
     };
     signal_emit_param(SIGNAL_USER_PRESENCE_REQUEST, &data);
-    cancel_button = false;
+    /* Mirror the firmware variant: a cancellation still marked on the
+     * unwinding transaction belongs to this wait; a stale one is discarded. */
+    if (!exec_finished_cancelled) {
+        cancel_button = false;
+    }
     emul_button_wait_start(button_timeout);
     req_button_pending = true;
     emu_button_led_mode = led_get_mode();
     led_set_mode(MODE_BUTTON);
+    if (exec_finished_cancelled && cancel_button) {
+        /* CTAPHID_CANCEL arrived before this wait started (its
+         * EV_PRESS_BUTTON was still queued): deliver the cancellation
+         * immediately instead of running the wait. */
+        button_wait_poll();
+    }
 }
 
 void button_wait_poll(void) {

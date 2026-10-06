@@ -288,6 +288,42 @@ int (*hid_set_report_cb)(uint8_t, uint8_t, hid_report_type_t, uint8_t const *, u
 // Invoked when received SET_REPORT control request or
 // received data on OUT endpoint ( Report ID = 0, Type = 0 )
 
+/* Deferred packets while a cancelled CBOR transaction is unwinding.
+ *
+ * CTAPHID_CANCEL stops the response timeout and marks the aborted
+ * transaction (exec_finished_cancelled), but the old UP wait is only
+ * cancelled when button_task() next polls it (10 ms gate). Admitting a new
+ * packet in that window would race the old wait: usb_send_event()
+ * enqueues EV_CMD_AVAILABLE without awaiting acknowledgement, and the
+ * still-pending wait (pico-fido fido.c wait_button_pressed loop) removes
+ * and discards every non-button event - the new request would never be
+ * processed. While the marker is set, arriving packets are buffered here
+ * and replayed from hid_task() once the cancellation has been delivered
+ * and the aborted transaction's late completion has been consumed and
+ * dropped by card_status(). CANCEL and INIT pass through: CANCEL is
+ * harmless while unwinding, and INIT is the resync path whose card_exit()
+ * drains the queues and clears the marker (the buffered packets are
+ * dropped with the dead session). */
+#define HID_DEFERRED_MAX 4
+static uint8_t deferred_reports[HID_DEFERRED_MAX][HID_RPT_SIZE];
+static unsigned deferred_head = 0, deferred_tail = 0;
+
+static void hid_deferred_flush(void) {
+    deferred_head = deferred_tail = 0;
+}
+
+static bool hid_admission_deferred(const uint8_t *report) {
+    if (!exec_finished_cancelled) {
+        return false;
+    }
+    CTAPHID_FRAME const *frame = (CTAPHID_FRAME const *) report;
+    if (FRAME_TYPE(frame) == TYPE_INIT &&
+        (frame->init.cmd == CTAPHID_CANCEL || frame->init.cmd == CTAPHID_INIT)) {
+        return false;
+    }
+    return true;
+}
+
 void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize) {
     // This example doesn't use multiple report and report ID
     (void) itf;
@@ -298,6 +334,18 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
         //usb_rx(itf, buffer, bufsize);
         if (itf == ITF_HID_CTAP) {
             if (bufsize != HID_RPT_SIZE) {
+                return;
+            }
+            if (hid_admission_deferred(buffer)) {
+                unsigned next = (deferred_head + 1) % HID_DEFERRED_MAX;
+                if (next == deferred_tail) {
+                    /* Too many packets inside one unwind window: answer
+                     * honestly instead of dropping silently. */
+                    ctap_error(CTAP1_ERR_CHANNEL_BUSY);
+                    return;
+                }
+                memcpy(deferred_reports[deferred_head], buffer, HID_RPT_SIZE);
+                deferred_head = next;
                 return;
             }
             memcpy(hid_rx[itf].buffer + hid_rx[itf].w_ptr, buffer, bufsize);
@@ -452,6 +500,9 @@ int driver_process_usb_packet_hid(uint16_t read) {
         }
         if (ctap_req->init.cmd == CTAPHID_INIT) {
             card_exit();
+            /* The resync dropped the aborted session: buffered packets
+             * belong to it and are discarded with the drained queues. */
+            hid_deferred_flush();
             hid_tx[ITF_HID_CTAP].r_ptr = hid_tx[ITF_HID_CTAP].w_ptr = 0;
             init_fido();
             CTAPHID_INIT_REQ *req = (CTAPHID_INIT_REQ *) ctap_req->init.data;
@@ -583,7 +634,13 @@ int driver_process_usb_packet_hid(uint16_t read) {
         else if ((last_cmd == CTAPHID_CBOR || last_cmd >= CTAPHID_VENDOR_FIRST) &&
                  (msg_packet.len == 0 || (msg_packet.len == msg_packet.current_len && msg_packet.len > 0))) {
             thread_type = 2;
-            cancel_button = false;
+            /* The admission-deferral gate above keeps this branch out of a
+             * cancelled transaction's unwind window, so a pending
+             * cancellation is never cleared here before the old UP wait has
+             * observed it; the guard documents that invariant. */
+            if (!exec_finished_cancelled) {
+                cancel_button = false;
+            }
             select_app(CONST_BYTE_ARRAY(fido_aid + 1, fido_aid[0]));
             if (msg_packet.current_len == msg_packet.len && msg_packet.len > 0) {
                 apdu_sent = cbor_process(last_cmd, msg_packet.data, msg_packet.len);
@@ -701,6 +758,18 @@ void hid_task(void) {
         }
         else if (status == PICOKEYS_ERR_BLOCKED) {
             send_keepalive();
+        }
+    }
+    /* A packet buffered while a cancelled transaction was unwinding is
+     * replayed once the marker cleared: the cancellation has been delivered
+     * and the late completion consumed, so the replay's EV_CMD_AVAILABLE
+     * can only be consumed by the worker's command loop. */
+    if (!exec_finished_cancelled && deferred_head != deferred_tail) {
+        uint8_t replay[HID_RPT_SIZE];
+        while (deferred_head != deferred_tail && !exec_finished_cancelled) {
+            memcpy(replay, deferred_reports[deferred_tail], HID_RPT_SIZE);
+            deferred_tail = (deferred_tail + 1) % HID_DEFERRED_MAX;
+            tud_hid_set_report_cb(ITF_HID_CTAP, 0, 0, replay, HID_RPT_SIZE);
         }
     }
     if (hid_tx[ITF_HID_CTAP].w_ptr > hid_tx[ITF_HID_CTAP].r_ptr && last_write_result[ITF_HID_CTAP] != WRITE_PENDING) {

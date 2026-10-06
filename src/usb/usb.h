@@ -110,7 +110,14 @@ extern bool is_busy(void);
  * transaction (its own keepalive-cancel response already went out): the
  * card thread's late EV_EXEC_FINISHED for that cancelled transaction is
  * then consumed and dropped by card_status(), so it is never delivered to
- * the host as a stale frame and the next request is armed normally. */
+ * the host as a stale frame and the next request is armed normally.
+ *
+ * The marker also serializes retry admission against the cancellation:
+ * while it is set, hid.c defers new CTAPHID packets (buffering and
+ * replaying them from hid_task()) so a fast same-channel retry's
+ * EV_CMD_AVAILABLE cannot be consumed and discarded by the still-pending
+ * UP wait, and button.c delivers a pending cancellation at wait start
+ * instead of discarding it as stale. */
 extern volatile bool exec_finished_cancelled;
 extern void usb_desc_setup(void);
 
