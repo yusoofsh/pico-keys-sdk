@@ -230,7 +230,15 @@ void button_wait_start_timeout(uint32_t timeout_seconds) {
 void button_wait_poll(void) {
     button_event_t result = emul_button_wait_poll();
     if (result == BUTTON_EV_NONE) {
-        return;
+        if (cancel_button) {
+            /* A CTAPHID_CANCEL aborts the pending wait; like the firmware
+               variant, it must not leave the command hanging. */
+            cancel_button = false;
+            result = BUTTON_EV_CANCELLED;
+        }
+        else {
+            return;
+        }
     }
     emul_button_wait_end();
     req_button_pending = false;
@@ -249,6 +257,7 @@ void button_wait_poll(void) {
         signal_emit(SIGNAL_USER_PRESENCE_CANCELLED);
     }
     queue_try_add(&usb_to_card_q, &flag);
+    cancel_button = false;
 }
 #endif
 
