@@ -95,6 +95,22 @@ endif()
 
 add_test(NAME object_policy_test COMMAND object_policy_test)
 
+add_executable(button_emul_test
+    ${CMAKE_CURRENT_LIST_DIR}/../src/usb/emulation/button_emul.c
+    ${CMAKE_CURRENT_LIST_DIR}/button_emul_test.c
+)
+target_compile_definitions(button_emul_test PRIVATE ENABLE_EMULATION)
+target_include_directories(button_emul_test PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src)
+
+if(MSVC)
+    target_compile_options(button_emul_test PRIVATE /W4 /WX)
+else()
+    target_compile_options(button_emul_test PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(button_emul_test PRIVATE pthread)
+endif()
+
+add_test(NAME button_emul_test COMMAND button_emul_test)
+
 add_executable(flash_layout_test
     ${CMAKE_CURRENT_LIST_DIR}/../src/fs/flash_layout.c
     ${CMAKE_CURRENT_LIST_DIR}/flash_layout_test.c
