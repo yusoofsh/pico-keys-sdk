@@ -303,13 +303,37 @@ int (*hid_set_report_cb)(uint8_t, uint8_t, hid_report_type_t, uint8_t const *, u
  * dropped by card_status(). CANCEL and INIT pass through: CANCEL is
  * harmless while unwinding, and INIT is the resync path whose card_exit()
  * drains the queues and clears the marker (the buffered packets are
- * dropped with the dead session). */
-#define HID_DEFERRED_MAX 4
+ * dropped with the dead session).
+ *
+ * The ring must not drop anything during the unwind, so it is sized for
+ * ONE complete maximum-size CTAPHID message: the transport reassembles up
+ * to CTAP_MAX_PACKET_SIZE payload bytes (one init packet plus 128
+ * continuations, ctap_hid.h), and the host is free to send all of those
+ * reports inside the window because SET_REPORT control transfers bypass
+ * the interrupt endpoint's 10 ms pacing. makeCredential retries are
+ * commonly several reports. A packet that does not fit - a second message
+ * or an interleaved channel - is answered with CTAP1_ERR_CHANNEL_BUSY
+ * instead of being dropped silently.
+ *
+ * Sizing the ring was chosen over the two alternatives:
+ * - Non-dropping backpressure (leaving the OUT endpoint un-armed so the
+ *   host NAKs, or not reading the emulation socket) cannot be applied
+ *   here without modifying third-party code: the control SET_REPORT data
+ *   phase is consumed inside TinyUSB before this callback runs, and the
+ *   OUT endpoint is re-armed inside TinyUSB's device task.
+ * - Delivering the cancellation synchronously from the CANCEL branch
+ *   would have to push a button event while the old UP wait may not even
+ *   have started yet (its EV_PRESS_BUTTON may still be queued), and the
+ *   worker's command loop would then read that stray event as a command.
+ *   Deferral leaves the queue protocol untouched and keeps the
+ *   cancellation delivery on the path that already owns it
+ *   (button_task / wait start). */
+#define HID_DEFERRED_MAX (1 + (CTAP_MAX_PACKET_SIZE - (HID_RPT_SIZE - 7) + (HID_RPT_SIZE - 5) - 1) / (HID_RPT_SIZE - 5))
 static uint8_t deferred_reports[HID_DEFERRED_MAX][HID_RPT_SIZE];
-static unsigned deferred_head = 0, deferred_tail = 0;
+static unsigned deferred_head = 0, deferred_tail = 0, deferred_count = 0;
 
 static void hid_deferred_flush(void) {
-    deferred_head = deferred_tail = 0;
+    deferred_head = deferred_tail = deferred_count = 0;
 }
 
 static bool hid_admission_deferred(const uint8_t *report) {
@@ -337,15 +361,17 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
                 return;
             }
             if (hid_admission_deferred(buffer)) {
-                unsigned next = (deferred_head + 1) % HID_DEFERRED_MAX;
-                if (next == deferred_tail) {
-                    /* Too many packets inside one unwind window: answer
-                     * honestly instead of dropping silently. */
+                if (deferred_count == HID_DEFERRED_MAX) {
+                    /* Does not fit - by construction this is a second
+                     * message or an interleaved channel (one complete
+                     * maximum-size message always fits): answer honestly
+                     * instead of dropping silently. */
                     ctap_error(CTAP1_ERR_CHANNEL_BUSY);
                     return;
                 }
                 memcpy(deferred_reports[deferred_head], buffer, HID_RPT_SIZE);
-                deferred_head = next;
+                deferred_head = (deferred_head + 1) % HID_DEFERRED_MAX;
+                deferred_count++;
                 return;
             }
             memcpy(hid_rx[itf].buffer + hid_rx[itf].w_ptr, buffer, bufsize);
@@ -763,12 +789,15 @@ void hid_task(void) {
     /* A packet buffered while a cancelled transaction was unwinding is
      * replayed once the marker cleared: the cancellation has been delivered
      * and the late completion consumed, so the replay's EV_CMD_AVAILABLE
-     * can only be consumed by the worker's command loop. */
-    if (!exec_finished_cancelled && deferred_head != deferred_tail) {
+     * can only be consumed by the worker's command loop. The ring held one
+     * complete maximum-size message, so the replay never reassembles a
+     * partial one. */
+    if (!exec_finished_cancelled && deferred_count > 0) {
         uint8_t replay[HID_RPT_SIZE];
-        while (deferred_head != deferred_tail && !exec_finished_cancelled) {
+        while (deferred_count > 0 && !exec_finished_cancelled) {
             memcpy(replay, deferred_reports[deferred_tail], HID_RPT_SIZE);
             deferred_tail = (deferred_tail + 1) % HID_DEFERRED_MAX;
+            deferred_count--;
             tud_hid_set_report_cb(ITF_HID_CTAP, 0, 0, replay, HID_RPT_SIZE);
         }
     }
