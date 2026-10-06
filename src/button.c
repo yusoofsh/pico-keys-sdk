@@ -41,6 +41,9 @@ static bool req_button_pending = false;
 #ifndef ENABLE_EMULATION
 static bool async_button_wait = false;
 static bool async_button_pressed = false;
+/* Release-before-rearm: false while the level held at wait start has not
+ * been seen released, so a press that began before the wait cannot count. */
+static bool async_button_armed = false;
 static uint32_t async_button_started = 0;
 static uint32_t async_button_timeout = 0;
 static uint32_t async_button_led_mode = MODE_MOUNTED;
@@ -132,7 +135,12 @@ void button_wait_start_timeout(uint32_t timeout_seconds) {
     signal_emit_param(SIGNAL_USER_PRESENCE_REQUEST, &data);
     cancel_button = false;
     async_button_wait = true;
-    async_button_pressed = picok_board_button_read();
+    /* Only a fresh press that begins after this wait counts. A level already
+     * held (a press that started before the request, or one carried over
+     * from a cancelled or timed-out request) is ignored until a release
+     * re-arms the wait; releasing it never authorizes this request. */
+    async_button_pressed = false;
+    async_button_armed = !picok_board_button_read();
     async_button_started = board_millis();
     async_button_timeout = button_timeout;
     async_button_led_mode = led_get_mode();
@@ -146,7 +154,14 @@ void button_wait_poll(void) {
     }
     bool pressed = picok_board_button_read();
     uint32_t now = board_millis();
-    if (!async_button_pressed && pressed) {
+    if (!async_button_armed) {
+        /* A level already held when the wait started stays ignored until a
+         * release re-arms the wait. */
+        if (!pressed) {
+            async_button_armed = true;
+        }
+    }
+    else if (!async_button_pressed && pressed) {
         async_button_pressed = true;
     }
     button_event_t result = BUTTON_EV_NONE;

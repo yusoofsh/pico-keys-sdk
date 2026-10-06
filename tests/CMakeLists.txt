@@ -111,6 +111,37 @@ endif()
 
 add_test(NAME button_emul_test COMMAND button_emul_test)
 
+# --- firmware button harness --------------------------------------------------
+# Compiles the UNMODIFIED production src/button.c firmware path (PICO_PLATFORM
+# + PICO_RP2040, FORCE_BUTTON_WAIT) on the host against mocked Pico SDK
+# registers, queues and clock (tests/button_mocks/). The mocks are forced in
+# before any production include and suppress only the broad platform/RTC
+# headers via their own include guards; button.c itself stays untouched. One
+# scenario per process: the no-stale rule cases (a BOOT level already held
+# when a wait starts, or carried over from a cancelled or timed-out request,
+# must never authorize it) and the fresh-press and 30 s no-touch controls.
+add_executable(button_held_test
+    ${CMAKE_CURRENT_LIST_DIR}/../src/button.c
+    ${CMAKE_CURRENT_LIST_DIR}/button_held_test.c
+)
+target_compile_definitions(button_held_test PRIVATE PICO_PLATFORM PICO_RP2040 FORCE_BUTTON_WAIT)
+target_include_directories(button_held_test BEFORE PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/button_mocks # stub pico/hardware headers shadow the real ones
+    ${CMAKE_CURRENT_LIST_DIR}/../src
+    ${CMAKE_CURRENT_LIST_DIR}/../src/usb
+)
+if(MSVC)
+    message(FATAL_ERROR "the held-button harness mocks RP2040 registers; GCC-style host builds only")
+else()
+    target_compile_options(button_held_test PRIVATE
+        -include ${CMAKE_CURRENT_LIST_DIR}/button_mocks/button_mocks.h
+        -Wall -Wextra -Werror
+    )
+endif()
+foreach(scene IN ITEMS preheld cancelled_hold timedout_hold fresh_press no_touch)
+    add_test(NAME button_held_${scene} COMMAND button_held_test ${scene})
+endforeach()
+
 add_executable(flash_layout_test
     ${CMAKE_CURRENT_LIST_DIR}/../src/fs/flash_layout.c
     ${CMAKE_CURRENT_LIST_DIR}/flash_layout_test.c
