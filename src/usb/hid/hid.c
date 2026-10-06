@@ -106,7 +106,12 @@ int driver_init_hid(void) {
     apdu.header = ctap_req->init.data;
 
     ctap_resp = (CTAPHID_FRAME *) (hid_tx[ITF_HID_CTAP].buffer);
-    apdu.rdata = ctap_resp->init.data;
+    if (!is_busy()) {
+        /* A pending response owns apdu.rdata until its completion is
+         * delivered; a packet processed in between must not rebind it
+         * (see resp_data). */
+        apdu.rdata = ctap_resp->init.data;
+    }
     memset(ctap_resp, 0, sizeof(CTAPHID_FRAME));
 
     usb_set_timeout_counter(ITF_HID, 200);
@@ -362,10 +367,37 @@ static uint8_t hid_txn_state = HID_TXN_IDLE;
 /* The channel of the BUSY/UNWINDING transaction; while unwinding it is the
  * only channel whose reports the ring buffers. */
 static uint32_t hid_txn_cid = 0;
+/* Response identity of the in-flight command, snapshotted when the command
+ * is admitted (handed to the worker). At completion time, legal inline
+ * traffic from other channels - a PING echo, an INIT allocation - has
+ * advanced ctap_req/last_cmd, so the completion must be addressed from the
+ * admission-time identity: building it from the current globals would
+ * deliver the response to the wrong channel with the wrong command byte,
+ * and the owning channel would never see its answer. */
+static uint32_t resp_cid = 0;
+static uint8_t resp_cmd = 0;
+/* Protected staging for the pending response's data (see resp_cid): the
+ * worker writes through apdu.rdata into this buffer, and the completion
+ * copies it into the TX ring - which inline traffic (another channel's PING
+ * echo, the keepalive-cancel frame, driver_init_hid's per-packet rebinds)
+ * may have overwritten in the meantime. */
+static uint8_t resp_data[CTAP_MAX_PACKET_SIZE];
 
 static void hid_deferred_flush(void) {
     deferred_head = deferred_tail = deferred_count = 0;
 }
+
+#ifdef HID_CANCEL_TEST_HOOKS
+/* Host-harness visibility into the transaction state machine (the test
+ * suite compiles hid.c with HID_CANCEL_TEST_HOOKS to print this state in
+ * its failure dumps). */
+void hid_cancel_test_state(uint8_t *txn_state, uint32_t *txn_cid, unsigned *def_count, bool *cancel_marker) {
+    *txn_state = hid_txn_state;
+    *txn_cid = hid_txn_cid;
+    *def_count = deferred_count;
+    *cancel_marker = cancel_button;
+}
+#endif
 
 static void hid_txn_sync(void) {
     if (hid_txn_state == HID_TXN_BUSY && !is_busy()) {
@@ -450,14 +482,20 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
 uint32_t last_cmd_time = 0, last_packet_time = 0;
 /* CTAPHID_ERROR with an explicit channel: the admission gate answers raw
  * reports before they are copied into ctap_req, so the stale ctap_req->cid
- * must not be used there. */
+ * must not be used there. The frame is built in the tail buffer and
+ * transmitted directly (like send_keepalive): the TX ring may already hold
+ * a pending frame (e.g. the fabricated keepalive-cancel waiting for the
+ * next hid_task flush), and driver_init_hid() resets the ring pointers per
+ * received packet - a ring-queued error could be wiped before it is ever
+ * flushed. */
 static int ctap_error_cid(uint32_t cid, uint8_t error) {
-    memset((uint8_t *)ctap_resp, 0, sizeof(CTAPHID_FRAME));
-    ctap_resp->cid = cid;
-    ctap_resp->init.cmd = CTAPHID_ERROR;
-    ctap_resp->init.bcntl = 1;
-    ctap_resp->init.data[0] = error;
-    hid_write(64);
+    CTAPHID_FRAME *resp = (CTAPHID_FRAME *) (hid_tx[ITF_HID_CTAP].buffer + sizeof(hid_tx[ITF_HID_CTAP].buffer) - 64);
+    memset((uint8_t *)resp, 0, sizeof(CTAPHID_FRAME));
+    resp->cid = cid;
+    resp->init.cmd = CTAPHID_ERROR;
+    resp->init.bcntl = 1;
+    resp->init.data[0] = error;
+    driver_write_hid(ITF_HID_CTAP, CONST_BYTE_ARRAY((const uint8_t *)resp, 64));
     last_packet_time = 0;
     return 0;
 }
@@ -675,6 +713,8 @@ int driver_process_usb_packet_hid(uint16_t read) {
                   (msg_packet.len == msg_packet.current_len && msg_packet.len > 0))) {
             if (msg_packet.current_len == msg_packet.len && msg_packet.len > 0) {
                 memcpy(ctap_resp->init.data, msg_packet.data, msg_packet.len);
+                resp_cid = ctap_req->cid;
+                resp_cmd = last_cmd;
                 driver_exec_finished_hid(msg_packet.len);
             }
             else {
@@ -756,6 +796,8 @@ int driver_process_usb_packet_hid(uint16_t read) {
             }
 
             thread_type = 1;
+            resp_cid = ctap_req->cid;
+            resp_cmd = last_cmd;
 
             if (msg_packet.current_len == msg_packet.len && msg_packet.len > 0) {
                 apdu_sent = apdu_process(ITF_HID_CTAP, CONST_BYTE_ARRAY(msg_packet.data, msg_packet.len));
@@ -763,6 +805,10 @@ int driver_process_usb_packet_hid(uint16_t read) {
             else {
                 apdu_sent = apdu_process(ITF_HID_CTAP, CONST_BYTE_ARRAY(ctap_req->init.data, MSG_LEN(ctap_req)));
             }
+            /* See resp_data: the APDU worker's response bytes go to the
+             * protected staging too (is_nk's sw insert operates there). */
+            resp_data[0] = 0x00;
+            apdu.rdata = resp_data + 1;
             DEBUG_PAYLOAD(apdu.data, (int) apdu.nc);
             msg_packet.len = msg_packet.current_len = 0;
             last_packet_time = 0;
@@ -770,6 +816,8 @@ int driver_process_usb_packet_hid(uint16_t read) {
         else if ((last_cmd == CTAPHID_CBOR || last_cmd >= CTAPHID_VENDOR_FIRST) &&
                  (msg_packet.len == 0 || (msg_packet.len == msg_packet.current_len && msg_packet.len > 0))) {
             thread_type = 2;
+            resp_cid = ctap_req->cid;
+            resp_cmd = last_cmd;
             /* The admission-deferral gate above keeps this branch out of a
              * cancelled transaction's unwind window, so a pending
              * cancellation is never cleared here before the old UP wait has
@@ -784,6 +832,10 @@ int driver_process_usb_packet_hid(uint16_t read) {
             else {
                 apdu_sent = cbor_process(last_cmd, ctap_req->init.data, MSG_LEN(ctap_req));
             }
+            /* See resp_data: point the worker's response bytes at the
+             * protected staging instead of the shared TX ring. */
+            resp_data[0] = 0x00;
+            apdu.rdata = resp_data + 1;
             msg_packet.len = msg_packet.current_len = 0;
             last_packet_time = 0;
             if (apdu_sent < 0) {
@@ -824,7 +876,7 @@ static void send_keepalive(void) {
     }
     CTAPHID_FRAME *resp = (CTAPHID_FRAME *) (hid_tx[ITF_HID_CTAP].buffer + sizeof(hid_tx[ITF_HID_CTAP].buffer) - 64);
     //memset(ctap_resp, 0, sizeof(CTAPHID_FRAME));
-    resp->cid = ctap_req->cid;
+    resp->cid = resp_cid;
     resp->init.cmd = CTAPHID_KEEPALIVE;
     resp->init.bcntl = 1;
     resp->init.data[0] = is_req_button_pending() ? 2 : 1;
@@ -837,7 +889,7 @@ static void send_keepalive(void) {
 void driver_exec_finished_hid(uint16_t size_next) {
     if (size_next > 0) {
         if (thread_type == 2 && apdu.sw != 0) {
-            ctap_error(apdu.sw & 0xff);
+            ctap_error_cid(resp_cid, apdu.sw & 0xff);
         }
         else {
             if (is_nk) {
@@ -853,11 +905,15 @@ void driver_exec_finished_hid(uint16_t size_next) {
 void driver_exec_finished_cont_hid(uint8_t itf, uint16_t size_next, uint16_t offset) {
     offset -= 7;
     ctap_resp = (CTAPHID_FRAME *) (hid_tx[itf].buffer + offset);
-    ctap_resp->cid = ctap_req->cid;
+    ctap_resp->cid = resp_cid;
     ctap_resp->init.bcnth = size_next >> 8;
     ctap_resp->init.bcntl = size_next & 0xff;
     send_buffer_size[itf] = size_next;
-    ctap_resp->init.cmd = last_cmd;
+    ctap_resp->init.cmd = resp_cmd;
+    /* The pending response's data was staged at admission (resp_data);
+     * copy it to the ring now, in case inline traffic overwrote the ring
+     * bytes while the command was in flight. */
+    memcpy(hid_tx[itf].buffer + offset + 7, resp_data, MIN(size_next, (uint16_t) sizeof(resp_data)));
     if (hid_write_offset(size_next+7, offset) > 0) {
         //ctap_resp = (CTAPHID_FRAME *) ((uint8_t *) ctap_resp + 64 - 5);
         //send_buffer_size[ITF_HID_CTAP] -= MIN(64 - 7, send_buffer_size[ITF_HID_CTAP]);
