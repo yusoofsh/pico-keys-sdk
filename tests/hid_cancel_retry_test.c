@@ -101,8 +101,10 @@ int emul_init(const char *host, uint16_t port) { (void) host; (void) port; retur
 void emul_task(void) {}
 uint16_t emul_read(uint8_t itf) { (void) itf; return 0; }
 
-/* Captured TX: every 64-byte report the production code submits. */
-#define MAX_TX_FRAMES 32
+/* Captured TX: every 64-byte report the production code submits. Room for
+ * the pre-fix behaviour of a 129-report message, where every report past the
+ * old 3-slot ring is answered with a CHANNEL_BUSY error frame. */
+#define MAX_TX_FRAMES 300
 static uint8_t tx_frames[MAX_TX_FRAMES][HID_RPT_SIZE];
 static int tx_count = 0;
 bool tud_hid_n_report(uint8_t itf, uint8_t report_id, const uint8_t *buffer, uint32_t n) {
@@ -120,6 +122,7 @@ bool tud_hid_n_report(uint8_t itf, uint8_t report_id, const uint8_t *buffer, uin
 static int mock_parse_calls = 0;
 static uint8_t mock_parse_cmds[8];
 static uint8_t mock_parse_payload[8][8];
+static size_t mock_parse_lens[8];
 /* The test pushes one flag per admitted command (in order); the worker pops
  * one per parse, mirroring the FIFO the real queues provide. */
 static volatile bool mock_up_flags[8];
@@ -151,6 +154,7 @@ int cbor_process(uint8_t cmd, const uint8_t *data, size_t len) {
     mock_parse_cmds[mock_parse_calls] = cmd;
     memset(mock_parse_payload[mock_parse_calls], 0, 8);
     memcpy(mock_parse_payload[mock_parse_calls], data, len < 8 ? len : 8);
+    mock_parse_lens[mock_parse_calls] = len;
     mock_parse_calls++;
     ctap_resp->init.data[0] = 0;
     apdu.rdata = ctap_resp->init.data + 1;
@@ -262,6 +266,46 @@ static void build_cancel(void) {
 
 static void send_report(void) {
     tud_hid_set_report_cb(ITF_HID_CTAP, 0, 0, report, HID_RPT_SIZE);
+}
+
+/* Fragmented CTAPHID_CBOR message: an init packet carrying the 16-bit total
+ * length plus 59-byte continuations, exactly as a real client fragments one
+ * request. send_cbor_msg_full() delivers every report back-to-back with no
+ * hid_task/button_task pump in between - the pre-poll delivery ordering of
+ * the supported SET_REPORT control-transfer path. */
+static void send_cbor_msg_full(const uint8_t *payload, uint16_t len) {
+    uint16_t sent;
+    uint8_t seq = 0;
+    memset(report, 0, sizeof(report));
+    put32(report, CID);
+    report[4] = CTAPHID_CBOR;
+    report[5] = (uint8_t) (len >> 8);
+    report[6] = (uint8_t) len;
+    size_t n = len < (HID_RPT_SIZE - 7) ? len : (HID_RPT_SIZE - 7);
+    memcpy(report + 7, payload, n);
+    sent = (uint16_t) n;
+    send_report();
+    while (sent < len) {
+        uint16_t remain = (uint16_t) (len - sent);
+        memset(report, 0, sizeof(report));
+        put32(report, CID);
+        /* Continuation frame: [cid][seq (type bit b7 cleared)][59 payload] */
+        report[4] = seq++;
+        size_t cn = remain < (HID_RPT_SIZE - 5) ? remain : (HID_RPT_SIZE - 5);
+        memcpy(report + 5, payload + sent, cn);
+        sent = (uint16_t) (sent + cn);
+        send_report();
+    }
+}
+
+static int find_error_frame(int from) {
+    for (int i = from; i < tx_count; i++) {
+        const uint8_t *f = tx_frames[i];
+        if (f[4] == CTAPHID_ERROR) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 /* The index of the first TX frame carrying `cmd` for our channel at or
@@ -410,6 +454,172 @@ static void scene_fast_retry(void) {
     assert(first_resp > 0);
     printf("fast_retry: retry admitted only after the cancelled transaction unwound, "
            "answered exactly once with a correctly framed response\n");
+}
+
+/* Scrutiny round 4: a legal fragmented same-channel retry (makeCredential
+ * payloads are commonly larger than one report) delivered entirely before
+ * the next cancellation poll. The deferral ring must retain EVERY report of
+ * ONE CTAPHID message; losing any continuation to CHANNEL_BUSY leaves the
+ * reassembled message incomplete, its handler never runs and the partial
+ * message times out. */
+static void scene_fast_retry_fragmented(void) {
+    static uint8_t retry_payload[200]; /* init + 3 continuations = 4 reports */
+    for (unsigned i = 0; i < sizeof(retry_payload); i++) {
+        retry_payload[i] = (uint8_t) (i * 13 + 5);
+    }
+    static const uint8_t old_payload[] = { 0x04, 0xaa };
+
+    write_btn("none");
+    write_btn("timeout:0");
+    channel_setup();
+
+    /* Pending UP wait. */
+    mock_up_push(true);
+    build_cbor(old_payload, sizeof(old_payload));
+    send_report();
+    assert(spin_until(is_req_button_pending, 2000));
+
+    /* Host cancels; exactly one fabricated 0x2D goes out. */
+    build_cancel();
+    send_report();
+    pump_hid(6);
+    int cancel_resp = find_cbor_status_frame(CTAPHID_KEEPALIVE_CANCEL_STATUS, 1);
+    assert(cancel_resp > 0);
+    assert(find_cbor_status_frame(CTAPHID_KEEPALIVE_CANCEL_STATUS, cancel_resp + 1) < 0);
+    assert(exec_finished_cancelled);
+
+    /* The 4-report retry arrives BEFORE any button poll ran: every report
+     * must be buffered, none answered with an error. pump_hid flushes the
+     * TX ring only - no button poll, the unwind window is still open. */
+    mock_up_push(false);
+    send_cbor_msg_full(retry_payload, sizeof(retry_payload));
+    pump_hid(2);
+    assert(mock_parse_calls == 1);
+    assert(is_req_button_pending());
+    assert(find_error_frame(cancel_resp + 1) < 0);
+
+    /* Delivering the cancellation unwinds the old command; its late
+     * completion is dropped and the buffered message is replayed and
+     * processed exactly once, complete, with a correctly framed response. */
+    assert(spin_until(worker_saw_cancel, 2000));
+    assert(worker_cancelled == 1);
+    static const uint8_t retry_marker = 2;
+    bool retry_response_seen = false;
+    for (unsigned waited = 0; waited < 2000 && !retry_response_seen; waited += 2) {
+        for (int i = cancel_resp + 1; i < tx_count; i++) {
+            const uint8_t *f = tx_frames[i];
+            if (f[4] == CTAPHID_CBOR && f[5] == 0 && f[6] == 2 && f[7] == 0x00 && f[8] == retry_marker) {
+                retry_response_seen = true;
+            }
+        }
+        if (!retry_response_seen) {
+            usleep(2000);
+            hid_task();
+            button_task();
+        }
+    }
+    assert(retry_response_seen);
+    assert(mock_parse_calls == 2);
+    assert(mock_parse_cmds[1] == CTAPHID_CBOR);
+    assert(mock_parse_lens[1] == sizeof(retry_payload));
+    assert(memcmp(mock_parse_payload[1], retry_payload, 8) == 0);
+    assert(worker_cancelled == 1 && worker_pressed == 0 && worker_timed_out == 0);
+    assert(!exec_finished_cancelled);
+    assert(!is_req_button_pending());
+    assert(!is_busy());
+    /* Exactly one response frame after the 0x2D and no error frame: nothing
+     * was dropped to CHANNEL_BUSY and nothing is stray. */
+    int first_resp = -1;
+    for (int i = cancel_resp + 1; i < tx_count; i++) {
+        const uint8_t *f = tx_frames[i];
+        if (f[4] == CTAPHID_CBOR && f[5] == 0) { /* a CBOR response, not keepalive */
+            assert(first_resp < 0);
+            first_resp = i;
+            assert(f[6] == 2 && f[7] == 0x00 && f[8] == retry_marker);
+        }
+    }
+    assert(first_resp > 0);
+    assert(find_error_frame(cancel_resp + 1) < 0);
+    printf("fast_retry_fragmented: a 4-report fragmented retry buffered whole during the unwind "
+           "is processed exactly once with a correctly framed response\n");
+}
+
+/* Same delivery ordering at the CTAPHID maximum message size the firmware
+ * supports: CTAP_MAX_PACKET_SIZE (7609) payload bytes = init packet plus 128
+ * continuations = 129 reports, all arriving before any cancellation poll.
+ * The deferral ring must hold exactly one such message. */
+static void scene_fast_retry_max_size(void) {
+    static uint8_t max_payload[CTAP_MAX_PACKET_SIZE];
+    for (unsigned i = 0; i < sizeof(max_payload); i++) {
+        max_payload[i] = (uint8_t) (i * 13 + 5);
+    }
+    static const uint8_t old_payload[] = { 0x04, 0xaa };
+
+    write_btn("none");
+    write_btn("timeout:0");
+    channel_setup();
+
+    mock_up_push(true);
+    build_cbor(old_payload, sizeof(old_payload));
+    send_report();
+    assert(spin_until(is_req_button_pending, 2000));
+
+    build_cancel();
+    send_report();
+    pump_hid(6);
+    int cancel_resp = find_cbor_status_frame(CTAPHID_KEEPALIVE_CANCEL_STATUS, 1);
+    assert(cancel_resp > 0);
+    assert(exec_finished_cancelled);
+
+    /* All 129 reports of the maximum-size retry arrive before any poll.
+     * pump_hid flushes the TX ring only - no button poll, the unwind
+     * window is still open. */
+    mock_up_push(false);
+    send_cbor_msg_full(max_payload, sizeof(max_payload));
+    pump_hid(2);
+    assert(mock_parse_calls == 1);
+    assert(is_req_button_pending());
+    assert(find_error_frame(cancel_resp + 1) < 0);
+
+    assert(spin_until(worker_saw_cancel, 2000));
+    assert(worker_cancelled == 1);
+    static const uint8_t retry_marker = 2;
+    bool retry_response_seen = false;
+    for (unsigned waited = 0; waited < 2000 && !retry_response_seen; waited += 2) {
+        for (int i = cancel_resp + 1; i < tx_count; i++) {
+            const uint8_t *f = tx_frames[i];
+            if (f[4] == CTAPHID_CBOR && f[5] == 0 && f[6] == 2 && f[7] == 0x00 && f[8] == retry_marker) {
+                retry_response_seen = true;
+            }
+        }
+        if (!retry_response_seen) {
+            usleep(2000);
+            hid_task();
+            button_task();
+        }
+    }
+    assert(retry_response_seen);
+    assert(mock_parse_calls == 2);
+    assert(mock_parse_cmds[1] == CTAPHID_CBOR);
+    assert(mock_parse_lens[1] == CTAP_MAX_PACKET_SIZE);
+    assert(memcmp(mock_parse_payload[1], max_payload, 8) == 0);
+    assert(worker_cancelled == 1 && worker_pressed == 0 && worker_timed_out == 0);
+    assert(!exec_finished_cancelled);
+    assert(!is_req_button_pending());
+    assert(!is_busy());
+    int first_resp = -1;
+    for (int i = cancel_resp + 1; i < tx_count; i++) {
+        const uint8_t *f = tx_frames[i];
+        if (f[4] == CTAPHID_CBOR && f[5] == 0) {
+            assert(first_resp < 0);
+            first_resp = i;
+            assert(f[6] == 2 && f[7] == 0x00 && f[8] == retry_marker);
+        }
+    }
+    assert(first_resp > 0);
+    assert(find_error_frame(cancel_resp + 1) < 0);
+    printf("fast_retry_max_size: a 129-report maximum-size retry buffered whole during the unwind "
+           "is processed exactly once with a correctly framed response\n");
 }
 
 /* The cancel arrives right after the admission keepalive, BEFORE the UP
@@ -633,6 +843,12 @@ int main(int argc, char **argv) {
     usb_init();
     if (strcmp(argv[1], "fast_retry") == 0) {
         scene_fast_retry();
+    }
+    else if (strcmp(argv[1], "fast_retry_fragmented") == 0) {
+        scene_fast_retry_fragmented();
+    }
+    else if (strcmp(argv[1], "fast_retry_max_size") == 0) {
+        scene_fast_retry_max_size();
     }
     else if (strcmp(argv[1], "cancel_before_wait_start") == 0) {
         scene_cancel_before_wait_start();

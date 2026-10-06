@@ -150,8 +150,10 @@ endforeach()
 # protocol of cbor_thread (src/cbor.c) and the UP wait
 # (pico-fido src/fido/fido.c: remove events until a button event arrives,
 # discarding anything else). One scenario per process: the fast retry that
-# arrives before the next 10 ms button poll (the race), the settled retry,
-# the no-retry no-stale control and a fresh-press control.
+# arrives before the next 10 ms button poll (the race), the same retry
+# fragmented into 4 reports and into the CTAPHID maximum message size
+# (129 reports), the settled retry, the no-retry no-stale control and a
+# fresh-press control.
 add_executable(hid_cancel_retry_test
     ${CMAKE_CURRENT_LIST_DIR}/../src/usb/hid/hid.c
     ${CMAKE_CURRENT_LIST_DIR}/../src/usb/usb.c
@@ -173,7 +175,7 @@ else()
     target_compile_options(hid_cancel_retry_test PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(hid_cancel_retry_test PRIVATE pthread)
 endif()
-foreach(scene IN ITEMS fast_retry cancel_before_wait_start settled_retry no_retry_after_cancel press_control)
+foreach(scene IN ITEMS fast_retry fast_retry_fragmented fast_retry_max_size cancel_before_wait_start settled_retry no_retry_after_cancel press_control)
     add_test(NAME hid_cancel_retry_${scene} COMMAND hid_cancel_retry_test ${scene})
 endforeach()
 
