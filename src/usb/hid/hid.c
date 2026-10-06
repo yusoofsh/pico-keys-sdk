@@ -402,6 +402,10 @@ int driver_process_usb_packet_hid(uint16_t read) {
                 ctap_resp->init.data[0] = CTAPHID_KEEPALIVE_CANCEL_STATUS;
                 hid_write(64);
                 timeout_stop();
+                /* The card thread unwinds the cancelled request and queues
+                 * its own EV_EXEC_FINISHED afterwards. card_status() drops
+                 * that late completion instead of delivering its frame. */
+                exec_finished_cancelled = true;
             }
             return 0;
         }

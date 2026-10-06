@@ -235,6 +235,8 @@ void timeout_stop(void) {
     timeout = 0;
 }
 
+volatile bool exec_finished_cancelled = false;
+
 void timeout_start(void) {
     timeout = board_millis();
 }
@@ -310,6 +312,9 @@ void card_exit(void) {
         hcore1 = NULL;
 #endif
     }
+    /* The queues above are drained, so no late completion can follow the
+     * cancelled transaction any more. */
+    exec_finished_cancelled = false;
     card_locked_itf = ITF_TOTAL;
     card_locked_func = NULL;
 }
@@ -345,6 +350,17 @@ int card_status(uint8_t itf) {
         //    printf("\n ------ M = %lu\n",m);
         if (has_m) {
             if (m == EV_EXEC_FINISHED) {
+                if (exec_finished_cancelled) {
+                    /* The host cancelled this transaction (CTAPHID_CANCEL)
+                     * and its keepalive-cancel response already went out.
+                     * Consume the card thread's late completion here and
+                     * drop it: delivering it would answer the NEXT request
+                     * with a stale frame. The timeout state is untouched
+                     * (already stopped by the cancel, or armed by the next
+                     * command), so the next completion is handled normally. */
+                    exec_finished_cancelled = false;
+                    return PICOKEYS_ERR_FILE_NOT_FOUND;
+                }
                 timeout_stop();
                 if (led_get_mode() == MODE_PROCESSING) {
                     led_set_mode(MODE_MOUNTED);

@@ -105,6 +105,13 @@ extern void usb_send_event(uint32_t flag);
 extern void timeout_stop(void);
 extern void timeout_start(void);
 extern bool is_busy(void);
+
+/* Set by the CTAPHID_CANCEL handling when it aborts a running CBOR
+ * transaction (its own keepalive-cancel response already went out): the
+ * card thread's late EV_EXEC_FINISHED for that cancelled transaction is
+ * then consumed and dropped by card_status(), so it is never delivered to
+ * the host as a stale frame and the next request is armed normally. */
+extern volatile bool exec_finished_cancelled;
 extern void usb_desc_setup(void);
 
 #ifdef USB_ITF_HID
