@@ -53,6 +53,18 @@ WEAK int picokey_init(void) {
     return 0;
 }
 
+/* Boot-stage hook: called once from main(), immediately before usb_init()
+ * (and therefore before tusb_init()), after led_init(). A board or product
+ * layer may provide a strong definition to latch early-boot state (for
+ * example: hold the companion off for this boot); the default does nothing. */
+WEAK void picokey_early_init(void) {
+}
+
+/* Main-loop hook: called once per core0_loop iteration, immediately after
+ * button_task(). Must never block or sleep. */
+WEAK void picokey_task(void) {
+}
+
 void execute_tasks(void);
 void execute_tasks(void) {
 #if !defined(ENABLE_EMULATION) && !defined(ESP_PLATFORM)
@@ -83,6 +95,7 @@ static void core0_loop(void *arg) {
         hwrng_task();
         flash_task();
         button_task();
+        picokey_task();
 #ifdef PICO_PLATFORM
         // Avoid a pure busy loop on core0; gives the system a scheduling hint.
         tight_loop_contents();
@@ -140,6 +153,8 @@ int main(void) {
 #endif
 
     led_init();
+
+    picokey_early_init();
 
     usb_init();
 
