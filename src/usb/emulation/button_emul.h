@@ -83,6 +83,13 @@ void emul_button_wait_end(void);
 button_event_t emul_button_wait_poll(void);
 void emul_button_task(void);
 
+/* Synchronous injection seam, for tests only: apply one command as if it
+ * had just been parsed from a freshly written control file, but without
+ * the file, its mtime dedup (whose coarse-clock granularity drops
+ * commands written less than about one kernel tick apart) or the 10 ms
+ * poll throttle. The state is updated before the call returns. */
+void emul_button_inject(emul_button_cmd_t cmd, uint32_t param);
+
 /* Blocking wait for callers that run on the main-loop thread (under
  * emulation the CCID and keyboard-HID transports are served there, so those
  * callers must not block on the button queues). Returns 0 pressed,

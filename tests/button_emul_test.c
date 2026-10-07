@@ -290,6 +290,61 @@ static void test_wait_local_press_timeout_and_cancel(void) {
     env_teardown();
 }
 
+static void test_inject_seam_is_synchronous(void) {
+    env_setup();
+    /* Remove the control file entirely: the injected state must stand on
+     * its own, and the absent file must never disturb it (keeps last
+     * mode). */
+    remove(btn_file);
+    remove(btn_tmp);
+
+    /* none: waits run to their timeout. */
+    emul_button_inject(EMUL_BTN_NONE, 0);
+    emul_button_wait_start(150);
+    assert(poll_until(2000) == BUTTON_EV_TIMEOUT);
+    emul_button_wait_end();
+
+    /* press: delivered on the very next poll with no sleep in between,
+     * and consumed by exactly one wait. */
+    emul_button_inject(EMUL_BTN_PRESS, 0);
+    emul_button_wait_start(5000);
+    assert(emul_button_wait_poll() == BUTTON_EV_PRESSED);
+    assert(emul_button_wait_poll() == BUTTON_EV_NONE);
+    emul_button_wait_end();
+    emul_button_wait_start(150);
+    assert(poll_until(2000) == BUTTON_EV_TIMEOUT);
+    emul_button_wait_end();
+
+    /* A press injected while idle stays pending for the NEXT wait (same
+     * semantics as the file command), and a later none clears it before
+     * it can authorize anything (no stale press). */
+    emul_button_inject(EMUL_BTN_PRESS, 0);
+    emul_button_inject(EMUL_BTN_NONE, 0);
+    emul_button_wait_start(150);
+    assert(poll_until(2000) == BUTTON_EV_TIMEOUT);
+    emul_button_wait_end();
+
+    /* cancel: discarded when injected with no active wait, delivered when
+     * injected while one runs (the synchronous analogue of writing the
+     * file while the wait is active). */
+    emul_button_inject(EMUL_BTN_CANCEL, 0);
+    emul_button_wait_start(150);
+    assert(poll_until(2000) == BUTTON_EV_TIMEOUT);
+    emul_button_wait_end();
+    emul_button_wait_start(30000);
+    emul_button_inject(EMUL_BTN_CANCEL, 0);
+    assert(emul_button_wait_poll() == BUTTON_EV_CANCELLED);
+    emul_button_wait_end();
+
+    /* timeout: the override applies and clears, synchronously. */
+    emul_button_inject(EMUL_BTN_TIMEOUT, 2);
+    assert(emul_button_timeout_seconds() == 2);
+    emul_button_inject(EMUL_BTN_TIMEOUT, 0);
+    assert(emul_button_timeout_seconds() == 0);
+
+    env_teardown();
+}
+
 int main(void) {
     test_parse_commands();
     test_timeout_override_resolution();
@@ -301,6 +356,7 @@ int main(void) {
     test_none_never_presses();
     test_absent_file_keeps_last_mode();
     test_wait_local_press_timeout_and_cancel();
+    test_inject_seam_is_synchronous();
     printf("button_emul_test: all cases passed\n");
     return 0;
 }

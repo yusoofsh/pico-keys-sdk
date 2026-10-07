@@ -184,6 +184,39 @@ static uint64_t mtime_key(const struct stat *st) {
 #endif
 }
 
+/* Apply one parsed command to the emulated button state. Shared by the
+ * control-file poll and the synchronous emul_button_inject() hook, so both
+ * entry points apply identical semantics. press_due_ms is the absolute
+ * `press-after` deadline: derived from the file mtime by the poll and from
+ * board_millis() by the hook. */
+static void emul_button_apply(emul_button_cmd_t cmd, uint32_t param, uint32_t press_due) {
+    current_cmd = cmd;
+    press_pending = false;
+    press_due_ms = press_due;
+    cmd_consumed = false;
+    switch (cmd) {
+        case EMUL_BTN_AUTO:
+        case EMUL_BTN_NONE:
+            cmd_consumed = true;
+            break;
+        case EMUL_BTN_TIMEOUT:
+            timeout_override_present = true;
+            timeout_override = param;
+            cmd_consumed = true;
+            break;
+        case EMUL_BTN_CANCEL:
+            if (!wait_active_flag) {
+                cmd_consumed = true; /* nothing to abort: discard */
+            }
+            break;
+        case EMUL_BTN_PRESS:
+            press_pending = true; /* delivered during the next wait */
+            break;
+        case EMUL_BTN_PRESS_AFTER:
+            break;
+    }
+}
+
 static void process_file(void) {
     const char *path = getenv(ENV_BUTTON_FILE);
     if (path == NULL || *path == '\0') {
@@ -213,32 +246,7 @@ static void process_file(void) {
     }
     cmd_mtime_key = key;
     have_cmd_mtime = true;
-    current_cmd = cmd;
-    press_pending = false;
-    press_due_ms = 0;
-    cmd_consumed = false;
-    switch (cmd) {
-        case EMUL_BTN_AUTO:
-        case EMUL_BTN_NONE:
-            cmd_consumed = true;
-            break;
-        case EMUL_BTN_TIMEOUT:
-            timeout_override_present = true;
-            timeout_override = param;
-            cmd_consumed = true;
-            break;
-        case EMUL_BTN_CANCEL:
-            if (!wait_active_flag) {
-                cmd_consumed = true; /* nothing to abort: discard */
-            }
-            break;
-        case EMUL_BTN_PRESS:
-            press_pending = true; /* delivered during the next wait */
-            break;
-        case EMUL_BTN_PRESS_AFTER:
-            press_due_ms = (uint32_t) (key / 1000000ull) + param;
-            break;
-    }
+    emul_button_apply(cmd, param, (uint32_t) (key / 1000000ull) + param);
 }
 
 /* Shared polling step: consumes idle cancels and press-after commands that
@@ -263,6 +271,21 @@ void emul_button_task(void) {
     last_poll_ms = now;
     last_poll_valid = true;
     emul_button_update();
+}
+
+/* Synchronous test hook (tests may call it from any thread that owns the
+ * main-loop side of the button state): apply one command exactly like a
+ * freshly written control file would be parsed by process_file(), but with
+ * no file, no mtime dedup and no poll throttle. The control file's command
+ * dedup compares modification times, whose granularity is the kernel's
+ * coarse clock tick (about CONFIG_HZ, e.g. 4 ms at HZ=250): two commands
+ * written less than one tick apart are indistinguishable and the second is
+ * silently dropped. Tests that need delivery racing neither the clock nor
+ * the 10 ms poll throttle inject here instead. The file poll keeps working
+ * alongside it: an absent file is a no-op, and a genuinely new file
+ * command still overrides the injected state. */
+void emul_button_inject(emul_button_cmd_t cmd, uint32_t param) {
+    emul_button_apply(cmd, param, board_millis() + param);
 }
 
 void emul_button_wait_start(uint32_t timeout_ms) {
