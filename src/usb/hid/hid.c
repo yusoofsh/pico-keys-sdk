@@ -28,6 +28,7 @@ static portMUX_TYPE mutex = portMUX_INITIALIZER_UNLOCKED;
 #include "emulation.h"
 #endif
 #include "ctap_hid.h"
+#include "kb_tx.h"
 #include "picokeys_version.h"
 #include "apdu.h"
 #include "usb.h"
@@ -104,6 +105,9 @@ void hid_init(void) {
     if (hid_tx == NULL) {
         hid_tx = (usb_buffer_t *)calloc(ITF_HID_TOTAL, sizeof(usb_buffer_t));
     }
+#ifndef ENABLE_EMULATION
+    kb_tx_init(&kb_tx_ops);
+#endif
 }
 
 int driver_init_hid(void) {
@@ -187,70 +191,63 @@ static uint32_t hid_write(uint16_t size) {
 }
 
 #ifndef ENABLE_EMULATION
-static uint8_t keyboard_buffer[256];
-static uint8_t keyboard_buffer_len = 0;
 static const uint8_t conv_table[128][2] =  { HID_ASCII_TO_KEYCODE };
-static uint8_t keyboard_w = 0;
-static bool sent_key = false;
-static bool keyboard_encode = false;
 
-void add_keyboard_buffer(const_byte_array_t data, bool encode) {
-    keyboard_buffer_len = (uint8_t)MIN(sizeof(keyboard_buffer), data.len);
-    memcpy(keyboard_buffer, data.data, keyboard_buffer_len);
-    keyboard_encode = encode;
+/* Transport ops of the single-owner keyboard transmitter (kb_tx.h). The
+ * keyboard send path gates on the keyboard HID instance,
+ * tud_hid_n_ready(ITF_HID_KB) — never on the generic tud_hid_ready(),
+ * which checks instance 0 (the CTAP HID interface). */
+static bool kb_tx_ready(void) {
+    return usb_kb_itf_enabled() && tud_hid_n_ready(ITF_HID_KB);
+}
+static bool kb_tx_send(uint8_t modifier, const uint8_t *keycodes) {
+    return tud_hid_n_keyboard_report(ITF_HID_KB, REPORT_ID_KEYBOARD, modifier, keycodes);
+}
+static void kb_tx_lookup(uint8_t ascii, uint8_t *modifier, uint8_t *keycode) {
+    /* conv_table covers ASCII only; a byte >= 128 in an encoded buffer
+     * types nothing rather than reading past the table. */
+    if (ascii < 128) {
+        if (conv_table[ascii][0]) {
+            *modifier = KEYBOARD_MODIFIER_LEFTSHIFT;
+        }
+        *keycode = conv_table[ascii][1];
+    }
+}
+static const kb_tx_ops_t kb_tx_ops = {
+    .ready = kb_tx_ready,
+    .send = kb_tx_send,
+    .lookup = kb_tx_lookup,
+};
+
+bool add_keyboard_buffer(const_byte_array_t data, bool encode) {
+    /* Legacy OTP entry point: typed as the OTP owner of the transmitter. */
+    return kb_tx_add_buffer(KB_TX_OWNER_OTP, data.data, data.len, encode);
 }
 
-void append_keyboard_buffer(const_byte_array_t data) {
-    if (keyboard_buffer_len + data.len < sizeof(keyboard_buffer)) {
-        memcpy(keyboard_buffer + keyboard_buffer_len, data.data, MIN(sizeof(keyboard_buffer) - keyboard_buffer_len, data.len));
-        keyboard_buffer_len += (uint8_t)MIN(sizeof(keyboard_buffer) - keyboard_buffer_len, data.len);
-    }
+bool append_keyboard_buffer(const_byte_array_t data) {
+    return kb_tx_append_buffer(KB_TX_OWNER_OTP, data.data, data.len);
 }
 
 static void send_hid_report(uint8_t report_id) {
-    if (!tud_hid_ready()) {
-        return;
-    }
+    (void)report_id;
+    /* All keyboard output flows through the single-owner transmitter: its
+     * injected ops gate on tud_hid_n_ready(ITF_HID_KB), and every key-down
+     * it sent is followed by an all-released report. */
+    kb_tx_task();
+}
+#endif
 
-    switch (report_id) {
-        case REPORT_ID_KEYBOARD: {
-            if (keyboard_w < keyboard_buffer_len) {
-                if (sent_key == false) {
-                    uint8_t keycode[6] = { 0 };
-                    uint8_t modifier = 0;
-                    uint8_t chr = keyboard_buffer[keyboard_w];
-                    if (keyboard_encode) {
-                        if (conv_table[chr][0]) {
-                            modifier = KEYBOARD_MODIFIER_LEFTSHIFT;
-                        }
-                        keycode[0] = conv_table[chr][1];
-                    }
-                    else {
-                        if (chr & 0x80) {
-                            modifier = KEYBOARD_MODIFIER_LEFTSHIFT;
-                        }
-                        keycode[0] = chr & 0x7f;
-                    }
-                    if (tud_hid_n_keyboard_report(ITF_HID_KB, REPORT_ID_KEYBOARD, modifier, keycode) == true) {
-                        sent_key = true;
-                    }
-                }
-                else {
-                    if (tud_hid_n_keyboard_report(ITF_HID_KB, REPORT_ID_KEYBOARD, 0, NULL) == true) {
-                        keyboard_w++;
-                        sent_key = false;
+bool usb_kb_itf_enabled(void) {
+    return ITF_HID_KB != ITF_INVALID;
+}
 
-                    }
-                }
-            }
-            else if (keyboard_w == keyboard_buffer_len && keyboard_buffer_len > 0) {
-                keyboard_w = keyboard_buffer_len = 0;
-            }
-        }
-        break;
+#ifndef ENABLE_EMULATION
+bool usb_kb_mounted(void) {
+    return tud_mounted();
+}
 
-        default: break;
-    }
+bool usb_kb_suspended(void) {
+    return tud_suspended();
 }
 #endif
 
@@ -990,7 +987,7 @@ void hid_task(void) {
     start_ms += interval_ms;
 
     // Remote wakeup
-    if (tud_suspended() && keyboard_buffer_len > 0) {
+    if (tud_suspended() && kb_tx_typing()) {
         tud_remote_wakeup();
     }
     else {

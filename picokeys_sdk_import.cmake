@@ -589,6 +589,7 @@ endfunction()
 if(USB_ITF_HID)
     list(APPEND PICOKEYS_SOURCES
         ${CMAKE_CURRENT_LIST_DIR}/src/usb/hid/hid.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/usb/hid/kb_tx.c
     )
     list(APPEND INCLUDES
         ${CMAKE_CURRENT_LIST_DIR}/src/usb/hid

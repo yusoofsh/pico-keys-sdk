@@ -158,8 +158,13 @@ typedef struct {
 #define CTAP1_ERR_INVALID_CHANNEL     0x0b    // CID not valid
 #define CTAP1_ERR_OTHER               0x7f    // Other unspecified error
 
-extern void add_keyboard_buffer(const_byte_array_t data, bool encode);
-extern void append_keyboard_buffer(const_byte_array_t data);
+/* Keyboard producers (OTP typing) go through the single-owner keyboard
+ * transmitter (kb_tx.h): add_keyboard_buffer() starts a fresh transaction as
+ * the OTP owner and is refused while reports are still going out, so it can
+ * never overwrite in-flight text. Claim the transmitter first with
+ * kb_tx_claim(KB_TX_OWNER_OTP) and release it after the last append. */
+extern bool add_keyboard_buffer(const_byte_array_t data, bool encode);
+extern bool append_keyboard_buffer(const_byte_array_t data);
 extern int driver_init_hid(void);
 extern int ctap_error(uint8_t error);
 extern uint16_t *get_send_buffer_size(uint8_t itf);

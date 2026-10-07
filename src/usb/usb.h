@@ -124,6 +124,14 @@ extern void usb_desc_setup(void);
 #ifdef USB_ITF_HID
 extern void driver_exec_finished_hid(uint16_t size_next);
 extern void driver_exec_finished_cont_hid(uint8_t itf, uint16_t size_next, uint16_t offset);
+
+/* Keyboard state the companion arbiter reads (thin accessors; the
+ * transmitter itself lives in usb/hid/kb_tx.h). */
+extern bool usb_kb_itf_enabled(void);
+#ifndef ENABLE_EMULATION
+extern bool usb_kb_mounted(void);
+extern bool usb_kb_suspended(void);
+#endif
 #endif
 
 #ifdef USB_ITF_CCID
