@@ -44,19 +44,32 @@ from this fork in this mission (no board was attached).**
 
 ## Run the host tests
 
+The test configure does **not** clone dependencies: `tests/CMakeLists.txt`
+compiles mbedtls sources from `third-party/mbedtls` and fails to configure
+without them. Clone the pinned mbedtls v3.6.7 there first (never committed):
+
+```sh
+git clone -q --depth 1 -b v3.6.7 https://github.com/Mbed-TLS/mbedtls.git third-party/mbedtls
+git -C third-party/mbedtls rev-parse HEAD   # 068ff080b369adfac81509f9b57b2afabaf82dc5
+```
+
+Then, with cmake, ninja and a host C compiler on `PATH`:
+
 ```sh
 cmake -S tests -B build-tests -G Ninja
 ninja -C build-tests
 ctest --test-dir build-tests --output-on-failure
 ```
 
-The configure step clones mbedtls v3.6.7 (pinned `068ff080`) into
-`third-party/mbedtls` (never committed). The suite covers the pure
-`flash_layout` unit tests and the integration harness that compiles the
-unmodified production `low_flash.c` against a mock NOR flash, plus the
-button, kb_tx and cancel-path harnesses.
+The suite covers the pure `flash_layout` unit tests and the integration
+harness that compiles the unmodified production `low_flash.c` against a mock
+NOR flash, plus the button, kb_tx and cancel-path harnesses. (The firmware
+build is different: its configure fetches `third-party/` dependencies on
+demand through `cmake/deps.cmake` — it is the host-test configure above that
+needs the explicit preclone.)
 
-The flash-size-limit python regression runs standalone:
+The flash-size-limit python regression runs standalone (needs `python3` and
+a C compiler with UBSan; gcc 13 works):
 
 ```sh
 python3 tests/test_flash_size_limit.py
@@ -76,6 +89,20 @@ scripts/pipico/build.sh   # in the pico-fido checkout
 That script pins the whole toolchain tuple, runs the image-bounds, clock and
 budget gates and fails on any warning. Build and test prerequisites are
 documented in the pico-fido fork's README and `docs/pipico/BASELINE.md`.
+
+## Publication order and the two checkouts
+
+- **The SDK branch is published first.** Push `pipico/companion-hooks`, let
+  its `pipico-sdk-tests` CI run conclude success on the new SHA, and only
+  then bump the `pico-keys-sdk` gitlink in the pico-fido fork
+  (`pipico/integration-v1`) to that SHA. Never push a root commit whose
+  gitlink names an SDK commit that is not yet on this fork.
+- **This repository exists as two checkouts**: this standalone clone and the
+  `pico-fido/pico-keys-sdk` submodule of the firmware fork. They diverge
+  silently unless synchronized: a commit made in one must be fetched and
+  checked out in the other (`git fetch <other-checkout> && git checkout
+  <sha>`) before any build, gate run or push, and the root then stages the
+  new gitlink (`git add pico-keys-sdk`).
 
 ## Test status labels
 
