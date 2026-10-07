@@ -181,6 +181,32 @@ foreach(scene IN ITEMS fast_retry fast_retry_fragmented fast_retry_max_size canc
     add_test(NAME hid_cancel_retry_${scene} COMMAND hid_cancel_retry_test ${scene})
 endforeach()
 
+# --- keyboard transmitter (pure state machine) --------------------------------
+# Single-owner keyboard transmitter: kb_tx_claim/release(owner) arbitration,
+# add/append refusal while text is in flight (no overwrite), and the
+# press-then-all-released guarantee, tested against a recorded transport that
+# models the HID keyboard endpoint (ready only when the previous report was
+# acked). The module is pure: compiled without TinyUSB or Pico SDK headers.
+add_executable(kb_tx_test
+    ${CMAKE_CURRENT_LIST_DIR}/../src/usb/hid/kb_tx.c
+    ${CMAKE_CURRENT_LIST_DIR}/kb_tx_test.c
+)
+target_include_directories(kb_tx_test PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../src
+    ${CMAKE_CURRENT_LIST_DIR}/../src/usb/hid
+)
+if(MSVC)
+    target_compile_options(kb_tx_test PRIVATE /W4 /WX)
+else()
+    target_compile_options(kb_tx_test PRIVATE -Wall -Wextra -Werror)
+endif()
+foreach(scene IN ITEMS
+    claim_owner busy_until_final_release no_overwrite add_requires_idle_and_owner
+    append capacity release_normal release_owner_change release_claim_race
+    release_not_ready readiness_gate)
+    add_test(NAME kb_tx_${scene} COMMAND kb_tx_test ${scene})
+endforeach()
+
 add_executable(flash_layout_test
     ${CMAKE_CURRENT_LIST_DIR}/../src/fs/flash_layout.c
     ${CMAKE_CURRENT_LIST_DIR}/flash_layout_test.c
