@@ -1515,6 +1515,25 @@ static void rnd_scan_window(int tx_start, int first_marker, int p_final, bool ex
     RASSERT(errors == (rnd_b_pings - echoed) + (rnd_b_cbor_sent - rnd_b_cbor_admitted));
 }
 
+/* Synchronous injection seam for the randomized scenes: apply an emulated
+ * button command without the control file, its mtime dedup or the 10 ms
+ * poll throttle (emul_button_inject updates the state before it returns).
+ *
+ * Why: the control file's command dedup compares modification times, whose
+ * granularity is the kernel's coarse clock tick (about CONFIG_HZ, 4 ms at
+ * HZ=250), while write_btn() sleeps only 2 ms after each rename - on this
+ * machine ~31% of consecutively written commands collide on the dedup key
+ * and the second (e.g. a `press`, the only consequential command of a
+ * randomized iteration) is silently dropped. A dropped press either leaves
+ * the wait pending forever (the line ~1685 signature) or lets an armed
+ * cancellation win a press_wins iteration (the line ~1643 signature): the
+ * round-6 flake. The deterministic scenes keep the file mechanism (they
+ * have one press per process and generous budgets); the randomized scenes
+ * need delivery that races neither the clock nor the scheduler. */
+static void rnd_inject_btn(emul_button_cmd_t cmd, uint32_t param) {
+    emul_button_inject(cmd, param);
+}
+
 static void scene_randomized(uint64_t seed, int iterations) {
     static const uint8_t old_payload[] = { 0x04, 0xaa };
     static uint8_t retry_payload[CTAP_MAX_PACKET_SIZE];
@@ -1526,8 +1545,12 @@ static void scene_randomized(uint64_t seed, int iterations) {
     printf("randomized: seed=0x%08llx iterations=%d\n", (unsigned long long) seed, iterations);
     fflush(stdout);
 
-    write_btn("none");
-    write_btn("timeout:0");
+    /* Every button command in this scene goes through the synchronous
+     * injection seam (see rnd_inject_btn): no control file is written, so
+     * the mtime dedup cannot drop a press. The env var stays set
+     * (env_setup) so waits are not auto-accepted. */
+    rnd_inject_btn(EMUL_BTN_NONE, 0);
+    rnd_inject_btn(EMUL_BTN_TIMEOUT, 0);
     channel_setup();
 
     for (rnd_iter = 0; rnd_iter < iterations; rnd_iter++) {
@@ -1558,10 +1581,11 @@ static void scene_randomized(uint64_t seed, int iterations) {
         rnd_dbg_kind = (int) kind;
         rnd_dbg_nb = n_b;
         rnd_dbg_press = press_wins ? 1 : 0;
-        /* Known button state for every iteration: a press left in the
-         * control file would complete the next wait before the cancel. */
-        write_btn("none");
-        write_btn("timeout:0");
+        /* Known button state for every iteration: a press left pending
+         * would complete the next wait before the cancel. The injection
+         * clears leftover state synchronously. */
+        rnd_inject_btn(EMUL_BTN_NONE, 0);
+        rnd_inject_btn(EMUL_BTN_TIMEOUT, 0);
         rnd_reset_test_state();
         RASSERT(rnd_quiescent());
 
@@ -1600,10 +1624,16 @@ static void scene_randomized(uint64_t seed, int iterations) {
             RASSERT(exec_finished_cancelled);
 
             if (press_wins) {
-                /* The press races the cancellation delivery: the wait ends
-                 * PRESSED (emul answers the press before the armed cancel),
-                 * the cancelled transaction's completion is still dropped. */
-                write_btn("press");
+                /* The press is injected after the cancellation was armed
+                 * (cancel_button set) but before the next button poll: the
+                 * wait ends PRESSED (button_wait_poll answers the emulated
+                 * press before an armed cancel_button), the cancelled
+                 * transaction's completion is still dropped. Production
+                 * genuinely allows either winner (cancel vs press depends
+                 * on which is pending at the poll); the synchronous
+                 * injection pins the press-wins interleaving, so the
+                 * strict expectation below is deterministic. */
+                rnd_inject_btn(EMUL_BTN_PRESS, 0);
             }
 
             /* Retry + other-channel ops inside the unwind window (hid_task
@@ -1645,7 +1675,7 @@ static void scene_randomized(uint64_t seed, int iterations) {
             RASSERT(worker_cancel_parse_count == (press_wins ? -1 : 1)); /* only the old cmd was parsed at cancellation */
             RASSERT(mock_parse_calls == p_final);
             if (press_wins) {
-                write_btn("timeout:0"); /* clear the press for the next iteration */
+                rnd_inject_btn(EMUL_BTN_TIMEOUT, 0); /* clear the press for the next iteration */
             }
             /* The buffered retry was replayed whole and parsed exactly once. */
             RASSERT(mock_parse_cmds[1] == CTAPHID_CBOR);
@@ -1669,7 +1699,7 @@ static void scene_randomized(uint64_t seed, int iterations) {
             }
 
             rnd_phase = "press";
-            write_btn("press");
+            rnd_inject_btn(EMUL_BTN_PRESS, 0);
             int p_final = 1;
             int want = p_final - first_marker + 1;
             int r = 0;
@@ -1689,7 +1719,7 @@ static void scene_randomized(uint64_t seed, int iterations) {
             RASSERT(worker_pressed == 1 && worker_cancelled == 0 && worker_timed_out == 0);
             RASSERT(worker_cancel_parse_count == -1);
             RASSERT(mock_parse_calls == 1);
-            write_btn("timeout:0");
+            rnd_inject_btn(EMUL_BTN_TIMEOUT, 0);
             rnd_scan_window(tx_start, first_marker, p_final, false);
         }
         else { /* MODE_RESYNC */
