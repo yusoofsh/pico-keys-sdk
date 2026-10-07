@@ -68,6 +68,36 @@ uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t
 void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize);
 #endif
 
+#ifndef ENABLE_EMULATION
+/* Transport ops of the single-owner keyboard transmitter (kb_tx.h). The
+ * keyboard send path gates on the keyboard HID instance,
+ * tud_hid_n_ready(ITF_HID_KB) — never on the generic tud_hid_ready(),
+ * which checks instance 0 (the CTAP HID interface). Defined before
+ * hid_init(), which registers them. */
+static const uint8_t conv_table[128][2] =  { HID_ASCII_TO_KEYCODE };
+static bool kb_tx_ready(void) {
+    return usb_kb_itf_enabled() && tud_hid_n_ready(ITF_HID_KB);
+}
+static bool kb_tx_send(uint8_t modifier, const uint8_t *keycodes) {
+    return tud_hid_n_keyboard_report(ITF_HID_KB, REPORT_ID_KEYBOARD, modifier, keycodes);
+}
+static void kb_tx_lookup(uint8_t ascii, uint8_t *modifier, uint8_t *keycode) {
+    /* conv_table covers ASCII only; a byte >= 128 in an encoded buffer
+     * types nothing rather than reading past the table. */
+    if (ascii < 128) {
+        if (conv_table[ascii][0]) {
+            *modifier = KEYBOARD_MODIFIER_LEFTSHIFT;
+        }
+        *keycode = conv_table[ascii][1];
+    }
+}
+static const kb_tx_ops_t kb_tx_ops = {
+    .ready = kb_tx_ready,
+    .send = kb_tx_send,
+    .lookup = kb_tx_lookup,
+};
+#endif
+
 /* Transaction state of the HID transport: IDLE (no command in flight),
  * BUSY (a command is admitted to the worker; the TX ring holds its pending
  * response data from the worker's completion write until the delivery) and
@@ -191,34 +221,6 @@ static uint32_t hid_write(uint16_t size) {
 }
 
 #ifndef ENABLE_EMULATION
-static const uint8_t conv_table[128][2] =  { HID_ASCII_TO_KEYCODE };
-
-/* Transport ops of the single-owner keyboard transmitter (kb_tx.h). The
- * keyboard send path gates on the keyboard HID instance,
- * tud_hid_n_ready(ITF_HID_KB) — never on the generic tud_hid_ready(),
- * which checks instance 0 (the CTAP HID interface). */
-static bool kb_tx_ready(void) {
-    return usb_kb_itf_enabled() && tud_hid_n_ready(ITF_HID_KB);
-}
-static bool kb_tx_send(uint8_t modifier, const uint8_t *keycodes) {
-    return tud_hid_n_keyboard_report(ITF_HID_KB, REPORT_ID_KEYBOARD, modifier, keycodes);
-}
-static void kb_tx_lookup(uint8_t ascii, uint8_t *modifier, uint8_t *keycode) {
-    /* conv_table covers ASCII only; a byte >= 128 in an encoded buffer
-     * types nothing rather than reading past the table. */
-    if (ascii < 128) {
-        if (conv_table[ascii][0]) {
-            *modifier = KEYBOARD_MODIFIER_LEFTSHIFT;
-        }
-        *keycode = conv_table[ascii][1];
-    }
-}
-static const kb_tx_ops_t kb_tx_ops = {
-    .ready = kb_tx_ready,
-    .send = kb_tx_send,
-    .lookup = kb_tx_lookup,
-};
-
 bool add_keyboard_buffer(const_byte_array_t data, bool encode) {
     /* Legacy OTP entry point: typed as the OTP owner of the transmitter. */
     return kb_tx_add_buffer(KB_TX_OWNER_OTP, data.data, data.len, encode);
