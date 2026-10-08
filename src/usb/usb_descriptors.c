@@ -328,7 +328,7 @@ uint8_t const desc_bos[] = {
     // total length, number of device caps
     TUD_BOS_DESCRIPTOR(BOS_TOTAL_LEN, 2),
     // Vendor Code, iLandingPage
-    TUD_BOS_WEBUSB_DESCRIPTOR(VENDOR_REQUEST_WEBUSB, 1),
+    TUD_BOS_WEBUSB_DESCRIPTOR(VENDOR_REQUEST_WEBUSB, 0),
     // Microsoft OS 2.0 descriptor
     TUD_BOS_MS_OS_20_DESCRIPTOR(MS_OS_20_DESC_LEN, VENDOR_REQUEST_MICROSOFT)
 };
