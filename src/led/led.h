@@ -19,6 +19,7 @@
 #define _LED_H_
 
 #include <stdint.h>
+#include <stdbool.h>
 
 enum {
     LED_COLOR_OFF = 0,
@@ -64,6 +65,9 @@ enum  {
 extern void led_set_mode(uint32_t mode);
 extern uint32_t led_get_mode(void);
 extern void led_blink_n_times(uint8_t count, uint8_t color, uint32_t on_ms, uint32_t off_ms);
+/* Request a short, nonessential indication without preempting an existing
+ * FIDO blink or a high-priority LED mode. Returns false when it was skipped. */
+extern bool led_try_blink_n_times(uint8_t count, uint8_t color, uint32_t on_ms, uint32_t off_ms);
 extern void led_blinking_task(void);
 extern void led_off_all(void);
 extern void led_init(void);
