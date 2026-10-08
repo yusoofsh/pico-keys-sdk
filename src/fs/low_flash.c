@@ -19,6 +19,7 @@
 #include "serial.h"
 #include "crypto_utils.h"
 #include "pico_time.h"
+#include "flash_layout.h"
 #include <stdio.h>
 #ifdef PICO_PLATFORM
  #include "hardware/flash.h"
@@ -72,6 +73,19 @@ extern uint32_t FLASH_SIZE_BYTES;
 #define FLASH_SIZE_BYTES   (8 * 1024 * 1024)
 #endif
 
+#ifdef PICO_FLASH_SIZE_LIMIT_BYTES
+ // The cap is an RP2040-only option; picokeys_sdk_import.cmake rejects it at
+ // configure time on ESP32 and emulation too. Cap VALUES are validated at
+ // boot by compute_layout() (positive, sector-aligned, not larger than the
+ // clamped capacity, enough pool+journal headroom): an invalid value locks
+ // the storage instead of failing the build, so misaligned and too-small
+ // caps stay testable fail-closed in the host harness.
+ #if !defined(PICO_RP2040) || !PICO_RP2040 || defined(PICO_RP2350) || \
+     defined(ESP_PLATFORM) || defined(ENABLE_EMULATION)
+  #error "PICO_FLASH_SIZE_LIMIT_BYTES is only supported on RP2040"
+ #endif
+#endif
+
 #define TOTAL_FLASH_PAGES 6
 #define FLASH_CACHE_FLUSH_TIMEOUT_MS 5000u
 
@@ -101,6 +115,25 @@ static bool locked_out = true;
 static uint8_t ready_pages = 0;
 
 bool flash_available = false;
+
+// Set when the boot-time storage validation refuses to operate (invalid
+// geometry, foreign marker or failed marker readback): the device keeps
+// booting and enumerating, but every flash writer refuses to run and nothing
+// is ever wiped.
+static bool storage_locked = false;
+
+bool low_flash_storage_locked(void) {
+    return storage_locked;
+}
+
+#if defined(ENABLE_EMULATION)
+// Emulation-only test hook: force the storage-locked state without running
+// the RP2040 boot stage, so host tests can drive the application entry
+// points in the locked state. Firmware builds never compile this.
+void low_flash_storage_force_locked(bool locked) {
+    storage_locked = locked;
+}
+#endif
 
 //this function has to be called from the core 0
 void low_flash_task(void);
@@ -136,6 +169,9 @@ static uintptr_t pending_journal_addr;
 
 #if defined(PICO_PLATFORM) || defined(ESP_PLATFORM)
 static int do_flash_op_erase(uintptr_t addr) {
+    if (storage_locked) {
+        return PICOKEYS_ERR_BLOCKED;
+    }
     if (multicore_lockout_start_timeout_us(1000) == false) {
         printf("WARN: FLASH LOCKOUT START TIMEOUT\n");
         return PICOKEYS_ERR_NO_MEMORY;
@@ -151,6 +187,9 @@ static int do_flash_op_erase(uintptr_t addr) {
 }
 
 static int do_flash_op_program(uintptr_t addr, const uint8_t *data, size_t size) {
+    if (storage_locked) {
+        return PICOKEYS_ERR_BLOCKED;
+    }
     if (multicore_lockout_start_timeout_us(1000) == false) {
         printf("WARN: FLASH LOCKOUT START TIMEOUT\n");
         return PICOKEYS_ERR_NO_MEMORY;
@@ -166,6 +205,9 @@ static int do_flash_op_program(uintptr_t addr, const uint8_t *data, size_t size)
 }
 
 static int do_flash_op_erase_program(uintptr_t addr, const uint8_t *data, size_t size) {
+    if (storage_locked) {
+        return PICOKEYS_ERR_BLOCKED;
+    }
     if (multicore_lockout_start_timeout_us(1000) == false) {
         printf("WARN: FLASH LOCKOUT START TIMEOUT\n");
         return PICOKEYS_ERR_NO_MEMORY;
@@ -199,6 +241,9 @@ static int journal_mark_done(void) {
 #endif
 
 void low_flash_task(void) {
+    if (storage_locked) {
+        return; // never touch the flash when the storage is locked
+    }
 #ifdef ESP_PLATFORM
     bool flash_updated = false;
 #endif
@@ -419,6 +464,12 @@ static bool journal_entry_valid_at(const flash_journal_t *entry, uintptr_t journ
 
 int low_flash_recover_journal(bool force) {
 #if defined(PICO_PLATFORM) || defined(ESP_PLATFORM)
+    if (storage_locked) {
+        // No bounds were published: the journal sector is derived from
+        // last_base, which would underflow to 0xfffff000 here.
+        printf("INFO: STORAGE LOCKED: SKIP JOURNAL RECOVERY\n");
+        return PICOKEYS_ERR_BLOCKED;
+    }
     uintptr_t journal_sector = FLASH_SECTOR(last_base) - FLASH_SECTOR_SIZE;
     if (journal_sector < start_data_pool) {
         printf("WARN: FLASH JOURNAL SECTOR OUT OF RANGE\n");
@@ -516,6 +567,11 @@ int low_flash_recover_journal(bool force) {
 }
 
 int low_flash_first_init(void) {
+    if (storage_locked) {
+        // First-init seeds writes at the pool bounds; with the storage
+        // locked those bounds are zero, so refuse instead.
+        return PICOKEYS_ERR_BLOCKED;
+    }
     uint8_t empty[sizeof(uintptr_t) + sizeof(uint32_t)];
     memset(empty, 0, sizeof(empty));
 
@@ -542,13 +598,95 @@ int low_flash_first_init(void) {
 }
 
 #ifdef PICO_RP2040
-void phymarker_write(void);
+extern uintptr_t __phymarker_start; // defined below: use its value, never its address
+
+// The marker format depends on the SDK crc32c() (standard reflected CRC-32);
+// keep using it unchanged.
+static uint32_t phymarker_crc32(const uint8_t *data, size_t len) {
+    return crc32c(CONST_BYTE_ARRAY(data, len));
+}
+
+// The pure layout module documents the on-flash format with the same constants.
+_Static_assert(FLASH_SECTOR_SIZE == FLASH_LAYOUT_SECTOR_SIZE, "sector size mismatch");
+_Static_assert(FLASH_PAGE_SIZE == FLASH_MARKER_PAGE_SIZE, "page size mismatch");
+
+// Physical marker stage. It runs before core1 exists, so the flash window is
+// protected by disabling the interrupts only; never with a multicore lockout.
+//   VALID:            zero writes.
+//   BLANK:            program one full page, then read it back.
+//   LEGACY_TRUNCATED: erase the sector, program one full page, read it back.
+//   FOREIGN:          lock the storage and touch nothing (fail closed).
+// The stage is skipped entirely when the marker sector lies beyond the chip.
+static void phymarker_stage(bool marker_in_chip) {
+    if (!marker_in_chip) {
+        return;
+    }
+    const uint32_t marker_offset = __phymarker_start - XIP_BASE;
+    flash_marker_class_t marker_class = classify_marker_sector((const uint8_t *)__phymarker_start, pico_serial.id, phymarker_crc32);
+    if (marker_class == FLASH_MARKER_VALID) {
+        return;
+    }
+    if (marker_class == FLASH_MARKER_FOREIGN) {
+        printf("WARN: FOREIGN PHYSICAL MARKER: STORAGE LOCKED\n");
+        storage_locked = true;
+        return;
+    }
+    build_marker_page(pico_serial.id, data_page, phymarker_crc32);
+    uint32_t ints = save_and_disable_interrupts();
+    if (marker_class == FLASH_MARKER_LEGACY_TRUNCATED) {
+        flash_range_erase(marker_offset, FLASH_SECTOR_SIZE);
+    }
+    flash_range_program(marker_offset, data_page, FLASH_MARKER_PAGE_SIZE);
+    restore_interrupts(ints);
+    if (memcmp((const uint8_t *)__phymarker_start, data_page, FLASH_MARKER_PAGE_SIZE) != 0) {
+        printf("WARN: PHYSICAL MARKER READBACK MISMATCH: STORAGE LOCKED\n");
+        storage_locked = true;
+    }
+}
+
+// RP2040 boot stage, in order:
+// 1. the JEDEC read has already run;
+// 2. validate the capacity and compute the layout - any error locks the
+//    storage before a single flash write happens;
+// 3. handle the physical marker;
+// 4. flash_set_bounds last, only when every check passed.
+static void low_flash_init_rp2040(uint8_t jedec_capacity_e) {
+    uint32_t detected_bytes = 0;
+    if (validate_jedec_capacity(jedec_capacity_e, &detected_bytes) != FLASH_LAYOUT_OK) {
+        printf("WARN: FLASH CAPACITY INVALID (JEDEC 0x%02x): STORAGE LOCKED\n", (unsigned)jedec_capacity_e);
+        storage_locked = true;
+        return;
+    }
+#ifdef PICO_FLASH_SIZE_BYTES
+    const uint32_t build_time_bytes = PICO_FLASH_SIZE_BYTES;
+#else
+    const uint32_t build_time_bytes = detected_bytes; // no build-time size: nothing to clamp to
+#endif
+    flash_layout_t layout;
+#ifdef PICO_FLASH_SIZE_LIMIT_BYTES
+    // The marker-gap exclusion is a capped-build rule; compute_layout applies
+    // it only when the cap is defined, so uncapped boards keep their layout.
+    const int layout_rc = compute_layout(detected_bytes, build_time_bytes, true, PICO_FLASH_SIZE_LIMIT_BYTES,
+                                         __phymarker_start - XIP_BASE, FLASH_SECTOR_SIZE, FLASH_LAYOUT_RP2040, &layout);
+#else
+    const int layout_rc = compute_layout(detected_bytes, build_time_bytes, false, 0,
+                                         __phymarker_start - XIP_BASE, FLASH_SECTOR_SIZE, FLASH_LAYOUT_RP2040, &layout);
+#endif
+    if (layout_rc != FLASH_LAYOUT_OK) {
+        printf("WARN: FLASH LAYOUT INVALID: STORAGE LOCKED\n");
+        storage_locked = true;
+        return;
+    }
+    FLASH_SIZE_BYTES = layout.data_end;
+    phymarker_stage(!layout.marker_skipped);
+    if (storage_locked) {
+        return; // no usable bounds while the storage is locked
+    }
+    flash_set_bounds(XIP_BASE + layout.data_start, XIP_BASE + layout.data_end);
+}
 #endif
 //this function has to be called from the core 0
 void low_flash_init(void) {
-#ifdef PICO_RP2040
-    phymarker_write();
-#endif
     memset(flash_pages, 0, sizeof(page_flash_t) * TOTAL_FLASH_PAGES);
     mutex_init(&mtx_flash);
 
@@ -560,12 +698,36 @@ void low_flash_init(void) {
     data_start_addr = 0;
     data_end_addr = part0->size;
     FLASH_SIZE_BYTES = part0->size;
-#elif defined(PICO_PLATFORM)
+#elif defined(PICO_RP2040)
+    // Boot-stage order: JEDEC read, then validate the capacity and compute the
+    // layout BEFORE any flash mutation, then the marker handling, and
+    // flash_set_bounds last (low_flash_init_rp2040).
+    uint8_t txbuf[6] = {0x9f};
+    uint8_t rxbuf[6] = {0};
+    flash_do_cmd(txbuf, rxbuf, 4);
+    low_flash_init_rp2040(rxbuf[3]);
+    return;
+#elif defined(PICO_PLATFORM) // PICO_RP2350: partition-table logic, unchanged apart from the clamps
     uint8_t txbuf[6] = {0x9f};
     uint8_t rxbuf[6] = {0};
     flash_do_cmd(txbuf, rxbuf, 4);
 
-    FLASH_SIZE_BYTES = (1 << rxbuf[3]);
+    // RP2040 JEDEC validation and the whole RP2040 boot stage live in
+    // low_flash_init_rp2040() above; this branch is RP2350 only. The shift is
+    // unsigned so a large exponent cannot invoke signed-overflow UB.
+    FLASH_SIZE_BYTES = (1u << rxbuf[3]);
+#ifdef PICO_FLASH_SIZE_BYTES
+    // Clamp the detected capacity to the build-time board size: the pico-sdk
+    // hard_asserts every erase and program against it.
+    if (FLASH_SIZE_BYTES > PICO_FLASH_SIZE_BYTES) {
+        FLASH_SIZE_BYTES = PICO_FLASH_SIZE_BYTES;
+    }
+#endif
+#ifdef PICO_FLASH_SIZE_LIMIT_BYTES
+    if (FLASH_SIZE_BYTES > PICO_FLASH_SIZE_LIMIT_BYTES) {
+        FLASH_SIZE_BYTES = PICO_FLASH_SIZE_LIMIT_BYTES;
+    }
+#endif
 #ifdef PICO_RP2350
     __attribute__((aligned(4))) uint32_t workarea[1024];
     int rc = rom_load_partition_table((uint8_t *)workarea, sizeof(workarea), false);
@@ -589,11 +751,7 @@ void low_flash_init(void) {
         }
     }
     data_end_addr -= 2 * FLASH_SECTOR_SIZE;
-#else
-    data_start_addr = (FLASH_SIZE_BYTES >> 1);
-    data_end_addr = FLASH_SIZE_BYTES;
 #endif
-
     data_start_addr += XIP_BASE;
     data_end_addr += XIP_BASE;
 #else
@@ -695,6 +853,9 @@ static page_flash_t *find_free_page(uintptr_t addr) {
 }
 
 int flash_program_block(uintptr_t addr, const_byte_array_t data) {
+    if (storage_locked) {
+        return PICOKEYS_ERR_BLOCKED;
+    }
     if (!data.data || data.len == 0) {
         return PICOKEYS_ERR_NULL_PARAM;
     }
@@ -832,6 +993,9 @@ uint8_t flash_read_uint8(uintptr_t addr) {
 }
 
 int flash_erase_page(uintptr_t addr, size_t page_size) {
+    if (storage_locked) {
+        return PICOKEYS_ERR_BLOCKED;
+    }
     page_flash_t *p = NULL;
 
     mutex_enter_blocking(&mtx_flash);
@@ -874,33 +1038,10 @@ typedef struct {
     uint8_t  uid[PICO_UNIQUE_BOARD_ID_SIZE_BYTES];
     uint32_t crc32;
 } __attribute__ ((packed)) phymarker_t;
+_Static_assert(sizeof(phymarker_t) <= FLASH_PAGE_SIZE, "Physical marker must fit in one flash page");
 
 uintptr_t __phymarker_start = (uintptr_t)0x10100000;
 
 const uint64_t PHYSICAL_MARKER_MAGIC = 0x5049434F4B455953ULL; // "PICOKEYS"
-
-void phymarker_write(void) {
-    const uint64_t magic = *(uint64_t *)__phymarker_start;
-    if (magic == PHYSICAL_MARKER_MAGIC) {
-        return;
-    }
-    phymarker_t pm = {
-        .magic = PHYSICAL_MARKER_MAGIC, // "PICOKEYS"
-        .version = 0x0001,
-        .flags = 0x0000,
-        .crc32 = 0x00000000
-    };
-    memcpy(pm.uid, pico_serial.id, PICO_UNIQUE_BOARD_ID_SIZE_BYTES);
-    pm.crc32 = crc32c(CONST_BYTE_ARRAY((const uint8_t *)&pm, sizeof(phymarker_t) - sizeof(uint32_t)));
-
-    uint8_t *buf = data_page;
-    memcpy(buf, &pm, sizeof(phymarker_t));
-    uint32_t ints = save_and_disable_interrupts();
-
-    flash_range_erase((uint32_t)__phymarker_start - XIP_BASE, FLASH_SECTOR_SIZE);
-    flash_range_program((uint32_t)__phymarker_start - XIP_BASE, (const uint8_t *)buf, sizeof(buf));
-
-    restore_interrupts(ints);
-}
 
 #endif

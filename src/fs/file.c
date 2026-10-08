@@ -389,6 +389,13 @@ static void scan_region(bool persistent) {
 }
 
 void file_scan_flash(void) {
+    if (low_flash_storage_locked()) {
+        // No bounds were published: the scan reads the pool endpoints and
+        // journal recovery dereferences them, so run neither (they would
+        // read address 0 and underflow into 0xfffff000).
+        printf("INFO: STORAGE LOCKED: SKIP FLASH SCAN\n");
+        return;
+    }
     file_initialize_flash(false); //soft initialization
     uint32_t r1 = (uint32_t)flash_read_uintptr(end_rom_pool);
     uint32_t r2 = (uint32_t)flash_read_uintptr(end_rom_pool + sizeof(uintptr_t));

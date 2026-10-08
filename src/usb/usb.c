@@ -235,6 +235,8 @@ void timeout_stop(void) {
     timeout = 0;
 }
 
+volatile bool exec_finished_cancelled = false;
+
 void timeout_start(void) {
     timeout = board_millis();
 }
@@ -310,6 +312,9 @@ void card_exit(void) {
         hcore1 = NULL;
 #endif
     }
+    /* The queues above are drained, so no late completion can follow the
+     * cancelled transaction any more. */
+    exec_finished_cancelled = false;
     card_locked_itf = ITF_TOTAL;
     card_locked_func = NULL;
 }
@@ -330,7 +335,14 @@ void usb_task(void) {
 
 int card_status(uint8_t itf) {
     if (card_locked_itf == itf) {
-        if (timeout == 0) {
+        /* While a cancelled transaction is marked (CTAPHID_CANCEL aborted it
+         * and stopped the timeout), keep consuming queue events even though
+         * the timeout is disarmed: the marked late EV_EXEC_FINISHED must be
+         * dropped as soon as the worker unwinds, and a pending
+         * EV_PRESS_BUTTON of that same transaction must still start its
+         * (immediately cancelled) wait instead of staling in the queue.
+         * Without the marker this stays the upstream early return. */
+        if (timeout == 0 && !exec_finished_cancelled) {
             return PICOKEYS_ERR_FILE_NOT_FOUND;
         }
         uint32_t m = 0x0;
@@ -345,17 +357,28 @@ int card_status(uint8_t itf) {
         //    printf("\n ------ M = %lu\n",m);
         if (has_m) {
             if (m == EV_EXEC_FINISHED) {
+                if (exec_finished_cancelled) {
+                    /* The host cancelled this transaction (CTAPHID_CANCEL)
+                     * and its keepalive-cancel response already went out.
+                     * Consume the card thread's late completion here and
+                     * drop it: delivering it would answer the NEXT request
+                     * with a stale frame. The timeout state is untouched
+                     * (already stopped by the cancel, or armed by the next
+                     * command), so the next completion is handled normally. */
+                    exec_finished_cancelled = false;
+                    return PICOKEYS_ERR_FILE_NOT_FOUND;
+                }
                 timeout_stop();
                 if (led_get_mode() == MODE_PROCESSING) {
                     led_set_mode(MODE_MOUNTED);
                 }
                 return PICOKEYS_OK;
             }
-#ifndef ENABLE_EMULATION
             else if ((m & 0xffu) == EV_PRESS_BUTTON) {
+                // Dispatched in emulation builds too, where the emulated
+                // button (usb/emulation/button_emul.h) answers the wait.
                 button_wait_start_timeout(EV_PRESS_BUTTON_GET_TIMEOUT(m));
             }
-#endif
 #ifdef PICO_PLATFORM
             else if (m == EV_RESET) {
                 usb_secure_reboot_now();

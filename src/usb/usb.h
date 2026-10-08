@@ -105,11 +105,33 @@ extern void usb_send_event(uint32_t flag);
 extern void timeout_stop(void);
 extern void timeout_start(void);
 extern bool is_busy(void);
+
+/* Set by the CTAPHID_CANCEL handling when it aborts a running CBOR
+ * transaction (its own keepalive-cancel response already went out): the
+ * card thread's late EV_EXEC_FINISHED for that cancelled transaction is
+ * then consumed and dropped by card_status(), so it is never delivered to
+ * the host as a stale frame and the next request is armed normally.
+ *
+ * The marker also serializes retry admission against the cancellation:
+ * while it is set, hid.c defers new CTAPHID packets (buffering and
+ * replaying them from hid_task()) so a fast same-channel retry's
+ * EV_CMD_AVAILABLE cannot be consumed and discarded by the still-pending
+ * UP wait, and button.c delivers a pending cancellation at wait start
+ * instead of discarding it as stale. */
+extern volatile bool exec_finished_cancelled;
 extern void usb_desc_setup(void);
 
 #ifdef USB_ITF_HID
 extern void driver_exec_finished_hid(uint16_t size_next);
 extern void driver_exec_finished_cont_hid(uint8_t itf, uint16_t size_next, uint16_t offset);
+
+/* Keyboard state the companion arbiter reads (thin accessors; the
+ * transmitter itself lives in usb/hid/kb_tx.h). */
+extern bool usb_kb_itf_enabled(void);
+#ifndef ENABLE_EMULATION
+extern bool usb_kb_mounted(void);
+extern bool usb_kb_suspended(void);
+#endif
 #endif
 
 #ifdef USB_ITF_CCID

@@ -46,63 +46,23 @@
 
 extern int rescue_migrate_keydev(void);
 
-app_t apps[16];
-uint8_t num_apps = 0;
-
-app_t *current_app = NULL;
-
-const uint8_t *ccid_atr = NULL;
-
-bool app_exists(const_byte_array_t aid) {
-    for (int a = 0; a < num_apps; a++) {
-        if (aid.len >= apps[a].aid[0] && !memcmp(apps[a].aid + 1, aid.data, apps[a].aid[0])) {
-            return true;
-        }
-    }
-    return false;
-}
-
-int register_app(int (*select_aid)(app_t *, uint8_t), const uint8_t *aid) {
-    if (app_exists(CONST_BYTE_ARRAY(aid + 1, aid[0]))) {
-        return 1;
-    }
-    if (num_apps < sizeof(apps) / sizeof(app_t)) {
-        apps[num_apps].select_aid = select_aid;
-        apps[num_apps].aid = aid;
-        num_apps++;
-        return 1;
-    }
-    return 0;
-}
-
-int select_app(const_byte_array_t aid) {
-    if (current_app && current_app->aid && (current_app->aid + 1 == aid.data || (aid.len >= current_app->aid[0] && !memcmp(current_app->aid + 1, aid.data, current_app->aid[0])))) {
-        current_app->select_aid(current_app, 0);
-        return PICOKEYS_OK;
-    }
-    for (int a = 0; a < num_apps; a++) {
-        if (aid.len >= apps[a].aid[0] && !memcmp(apps[a].aid + 1, aid.data, apps[a].aid[0])) {
-            if (current_app) {
-                if (current_app->aid && aid.len >= current_app->aid[0] && !memcmp(current_app->aid + 1, aid.data, current_app->aid[0])) {
-                    current_app->select_aid(current_app, 1);
-                    return PICOKEYS_OK;
-                }
-                if (current_app->unload) {
-                    current_app->unload();
-                }
-            }
-            current_app = &apps[a];
-            if (current_app->select_aid(current_app, 1) == PICOKEYS_OK) {
-                return PICOKEYS_OK;
-            }
-        }
-    }
-    return PICOKEYS_ERR_FILE_NOT_FOUND;
-}
-
+// The application registry (apps, select_app, register_app) and the CCID ATR
+// pointer live in app.c.
 
 WEAK int picokey_init(void) {
     return 0;
+}
+
+/* Boot-stage hook: called once from main(), immediately before usb_init()
+ * (and therefore before tusb_init()), after led_init(). A board or product
+ * layer may provide a strong definition to latch early-boot state (for
+ * example: hold the companion off for this boot); the default does nothing. */
+WEAK void picokey_early_init(void) {
+}
+
+/* Main-loop hook: called once per core0_loop iteration, immediately after
+ * button_task(). Must never block or sleep. */
+WEAK void picokey_task(void) {
 }
 
 void execute_tasks(void);
@@ -135,6 +95,7 @@ static void core0_loop(void *arg) {
         hwrng_task();
         flash_task();
         button_task();
+        picokey_task();
 #ifdef PICO_PLATFORM
         // Avoid a pure busy loop on core0; gives the system a scheduling hint.
         tight_loop_contents();
@@ -174,10 +135,15 @@ int main(void) {
 
     low_flash_init();
 
-    file_scan_flash();
+    // Storage-locked boots publish no bounds: the flash scan and the keydev
+    // migration (both dereference the pool bounds through the file layer)
+    // must not run at all. The device keeps booting into usb_init below.
+    if (!low_flash_storage_locked()) {
+        file_scan_flash();
 
-    if (rescue_migrate_keydev() != PICOKEYS_OK) {
-        printf("Device attestation key migration failed\n");
+        if (rescue_migrate_keydev() != PICOKEYS_OK) {
+            printf("Device attestation key migration failed\n");
+        }
     }
 
     init_rtc();
@@ -187,6 +153,8 @@ int main(void) {
 #endif
 
     led_init();
+
+    picokey_early_init();
 
     usb_init();
 

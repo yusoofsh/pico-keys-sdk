@@ -62,6 +62,12 @@
 
 extern int picokey_init(void);
 
+/* Companion hooks (empty WEAK defaults in main.c): picokey_early_init()
+ * runs once just before usb_init(); picokey_task() runs once per core0
+ * loop iteration after button_task() and must never block. */
+extern void picokey_early_init(void);
+extern void picokey_task(void);
+
 extern void low_flash_init_core1(void);
 
 static inline uint16_t make_uint16_be(uint8_t b1, uint8_t b2) {

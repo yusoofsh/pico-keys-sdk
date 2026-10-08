@@ -104,6 +104,17 @@ add_compile_definitions(USB_PID=${USB_PID})
 if(NOT DEFINED DEBUG_APDU)
     set(DEBUG_APDU 0)
 endif()
+# RP2040-only JEDEC cap, e.g. -DPICO_FLASH_SIZE_LIMIT_BYTES=0x200000.
+# low_flash.c rejects other platforms at compile time; cap VALUES are
+# validated at boot by compute_layout(), which locks the storage on an
+# invalid value instead of failing the build.
+# Hardware evidence for this option is limited to YD-RP2040 4MB with a 2 MiB cap.
+if(DEFINED PICO_FLASH_SIZE_LIMIT_BYTES)
+    if(ESP_PLATFORM OR ENABLE_EMULATION)
+        message(FATAL_ERROR "PICO_FLASH_SIZE_LIMIT_BYTES is only supported on RP2040")
+    endif()
+    add_compile_definitions(PICO_FLASH_SIZE_LIMIT_BYTES=${PICO_FLASH_SIZE_LIMIT_BYTES})
+endif()
 if(NOT DEFINED ENABLE_EMULATION)
     set(ENABLE_EMULATION 0)
 endif()
@@ -358,6 +369,7 @@ elseif(PICO_RP2040)
 endif()
 
 list(APPEND PICOKEYS_SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/src/app.c
     ${CMAKE_CURRENT_LIST_DIR}/src/main.c
     ${CMAKE_CURRENT_LIST_DIR}/src/usb/usb.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fs/file.c
@@ -370,6 +382,7 @@ list(APPEND PICOKEYS_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/src/fs/object_crypto_provider.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fs/flash.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fs/low_flash.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fs/flash_layout.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fs/phy.c
     ${CMAKE_CURRENT_LIST_DIR}/src/otp/otp.c
     ${CMAKE_CURRENT_LIST_DIR}/src/rng/random.c
@@ -576,6 +589,7 @@ endfunction()
 if(USB_ITF_HID)
     list(APPEND PICOKEYS_SOURCES
         ${CMAKE_CURRENT_LIST_DIR}/src/usb/hid/hid.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/usb/hid/kb_tx.c
     )
     list(APPEND INCLUDES
         ${CMAKE_CURRENT_LIST_DIR}/src/usb/hid
@@ -613,6 +627,7 @@ if(ENABLE_EMULATION)
     add_compile_definitions(ENABLE_EMULATION)
     list(APPEND PICOKEYS_SOURCES
         ${CMAKE_CURRENT_LIST_DIR}/src/usb/emulation/emulation.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/usb/emulation/button_emul.c
     )
     if(USE_OPENSSL_EMULATION_WRAPPER)
         list(APPEND PICOKEYS_SOURCES
