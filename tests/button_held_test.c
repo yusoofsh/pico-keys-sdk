@@ -209,10 +209,10 @@ int main(int argc, char **argv) {
         button_wait_start();
         tick(2100, false);
         assert(usb_to_card_q.count == 0 && is_req_button_pending());
-        tick(32010, false); /* FORCE=true and timeout=0 resolves to 30 seconds */
+        tick(302010, false); /* FORCE=true and timeout=0 resolves to 300 seconds */
         expect_last(EV_BUTTON_TIMEOUT);
         assert(timed_out == 1 && completed == 0);
-        printf("no_touch: forced configured timeout=0 -> 30s -> EV_BUTTON_TIMEOUT=%u, completed=0\n", EV_BUTTON_TIMEOUT);
+        printf("no_touch: forced configured timeout=0 -> 300s -> EV_BUTTON_TIMEOUT=%u, completed=0\n", EV_BUTTON_TIMEOUT);
     } else {
         return 2;
     }
