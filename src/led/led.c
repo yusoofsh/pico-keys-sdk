@@ -63,7 +63,9 @@ bool led_try_blink_n_times(uint8_t count, uint8_t color, uint32_t on_ms, uint32_
     /* These modes represent an in-progress FIDO interaction. An optional
      * companion acknowledgement must never replace their visual feedback. */
     uint32_t mode = led_get_mode();
-    if (mode == MODE_PROCESSING || mode == MODE_BUTTON || mode == MODE_SUSPENDED) {
+    /* MODE_SUSPENDED also denotes an idle card after card_exit(), even
+     * when USB is awake. The companion gates actual USB suspension. */
+    if (mode == MODE_PROCESSING || mode == MODE_BUTTON) {
         return false;
     }
     blink_count = count;
