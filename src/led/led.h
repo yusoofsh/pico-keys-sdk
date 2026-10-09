@@ -56,8 +56,8 @@ enum {
 // modes, so use timing to separate idle heartbeat from a user-presence prompt.
 #define LED_STATUS_ON_MS 100
 #define LED_STATUS_OFF_MS 1900
-#define LED_BUTTON_ON_MS 100
-#define LED_BUTTON_OFF_MS 100
+#define LED_BUTTON_ON_MS 50
+#define LED_BUTTON_OFF_MS 50
 #else
 #define LED_STATUS_ON_MS 500
 #define LED_STATUS_OFF_MS 500
