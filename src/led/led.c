@@ -196,6 +196,12 @@ void led_init(void) {
     led_driver = &led_driver_cyw43;
     phy_data.led_driver = phy_data.led_driver_present ? phy_data.led_driver : PHY_LED_DRIVER_CYW43;
     phy_data.led_gpio = phy_data.led_gpio_present ? phy_data.led_gpio : CYW43_WL_GPIO_LED_PIN;
+#elif defined(VCC_GND_YD_RP2040_BUTTON_PIN) && defined(PICO_DEFAULT_LED_PIN)
+    // Some YD-RP2040 boards leave the RGB LED solder link open. Prefer the
+    // always-connected status LED so FIDO presence prompts remain visible.
+    led_driver = &led_driver_pico;
+    phy_data.led_driver = phy_data.led_driver_present ? phy_data.led_driver : PHY_LED_DRIVER_PICO;
+    phy_data.led_gpio = phy_data.led_gpio_present ? phy_data.led_gpio : PICO_DEFAULT_LED_PIN;
 #elif defined(PICO_DEFAULT_WS2812_PIN)
     led_driver = &led_driver_ws2812;
     phy_data.led_driver = phy_data.led_driver_present ? phy_data.led_driver : PHY_LED_DRIVER_WS2812;
