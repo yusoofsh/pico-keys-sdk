@@ -179,6 +179,8 @@ bool emul_button_on_main_thread(void) {
 static uint64_t mtime_key(const struct stat *st) {
 #ifdef _MSC_VER
     return (uint64_t) st->st_mtime * 1000000000ull;
+#elif defined(__APPLE__)
+    return (uint64_t) st->st_mtimespec.tv_sec * 1000000000ull + (uint64_t) st->st_mtimespec.tv_nsec;
 #else
     return (uint64_t) st->st_mtim.tv_sec * 1000000000ull + (uint64_t) st->st_mtim.tv_nsec;
 #endif
