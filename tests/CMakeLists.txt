@@ -207,8 +207,34 @@ foreach(scene IN ITEMS
     add_test(NAME kb_tx_${scene} COMMAND kb_tx_test ${scene})
 endforeach()
 
-add_executable(flash_layout_test
-    ${CMAKE_CURRENT_LIST_DIR}/../src/fs/flash_layout.c
+# --- SRAM PUF (pure) ----------------------------------------------------------
+# BCH(127,k,t) codec and the fuzzy extractor / enrollment state machine of
+# src/puf, against simulated SRAM chips. No Pico SDK headers.
+add_executable(bch_test
+    ${CMAKE_CURRENT_LIST_DIR}/../src/puf/bch.c
+    ${CMAKE_CURRENT_LIST_DIR}/bch_test.c
+)
+target_include_directories(bch_test PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src)
+add_executable(puf_fe_test
+    ${CMAKE_CURRENT_LIST_DIR}/../src/puf/bch.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/puf/puf_fe.c
+    ${CMAKE_CURRENT_LIST_DIR}/puf_fe_test.c
+)
+target_include_directories(puf_fe_test PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src ${CMAKE_CURRENT_LIST_DIR}/../src/puf)
+target_link_libraries(puf_fe_test PRIVATE object_crypto_mbedtls)
+foreach(target IN ITEMS bch_test puf_fe_test)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /WX)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Werror)
+    endif()
+endforeach()
+add_test(NAME bch_test COMMAND bch_test)
+foreach(scene IN ITEMS enroll_commit warm_boots_ignored retained_sample_ignored verify_failure_restarts committed_failure distinct_chips leftover_scratch_erased too_few_stable_bits)
+    add_test(NAME puf_fe_${scene} COMMAND puf_fe_test ${scene})
+endforeach()
+
+add_executable(flash_layout_test    ${CMAKE_CURRENT_LIST_DIR}/../src/fs/flash_layout.c
     ${CMAKE_CURRENT_LIST_DIR}/flash_layout_test.c
 )
 target_include_directories(flash_layout_test PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../src ${CMAKE_CURRENT_LIST_DIR}/../src/fs)

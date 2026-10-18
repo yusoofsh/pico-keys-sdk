@@ -385,6 +385,9 @@ list(APPEND PICOKEYS_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/src/fs/flash_layout.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fs/phy.c
     ${CMAKE_CURRENT_LIST_DIR}/src/otp/otp.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/puf/bch.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/puf/puf_fe.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/puf/puf.c
     ${CMAKE_CURRENT_LIST_DIR}/src/rng/random.c
     ${CMAKE_CURRENT_LIST_DIR}/src/rng/hwrng.c
     ${CMAKE_CURRENT_LIST_DIR}/src/eac.c
@@ -432,6 +435,7 @@ list(APPEND INCLUDES
     ${CMAKE_CURRENT_LIST_DIR}/src/rng
     ${CMAKE_CURRENT_LIST_DIR}/src/led
     ${CMAKE_CURRENT_LIST_DIR}/src/otp
+    ${CMAKE_CURRENT_LIST_DIR}/src/puf
     ${CMAKE_CURRENT_LIST_DIR}/third-party/mbedtls/library
 )
 set(SYSTEM_INCLUDES
