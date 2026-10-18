@@ -30,7 +30,6 @@ puf_status_t puf_status = PUF_STATUS_OFF;
 #include <string.h>
 
 #include "picokeys.h"
-#include "file.h"
 #include "flash.h"
 #include "random.h"
 #include "led/led.h"
@@ -40,8 +39,6 @@ puf_status_t puf_status = PUF_STATUS_OFF;
 #include "hardware/sync.h"
 #include "hardware/structs/vreg_and_chip_reset.h"
 #include "hardware/structs/watchdog.h"
-
-#define EF_PUF_HELPER 0xE5F0
 
 // The lower half of SCRATCH_X. Nothing is linked there (.scratch_x is empty),
 // the heap ends below it and core1's stack occupies only the upper half; the
@@ -71,74 +68,69 @@ static void rng(uint8_t *buf, size_t len) {
     random_fill_buffer(BYTE_ARRAY(buf, len));
 }
 
-// The enrollment scratch lives in its own sector just below the storage
-// marker, outside the file system, so erasing it really destroys the raw
-// samples. Runs before core1 exists: disabling interrupts is enough.
-static void scratch_erase(uintptr_t addr) {
+// The PUF sector sits just below the storage marker, outside the file system.
+// It holds the enrollment scratch until enrollment ends and the public helper
+// from then on, so finishing enrollment overwrites the raw samples. Direct
+// sector writes also work this early: a file system write that spans two
+// sectors needs a flush that only core1 can run, and core1 does not exist
+// yet, which is also why disabling interrupts is enough here.
+#define PROGRAM_SIZE(n) ((((n) + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE)
+#define SCRATCH_BUF_SIZE PROGRAM_SIZE(sizeof(puf_scratch_t))
+#define HELPER_BUF_SIZE PROGRAM_SIZE(sizeof(puf_helper_t))
+_Static_assert(SCRATCH_BUF_SIZE <= FLASH_SECTOR_SIZE, "PUF scratch must fit one sector");
+_Static_assert(HELPER_BUF_SIZE <= FLASH_SECTOR_SIZE, "PUF helper must fit one sector");
+
+// data == NULL only erases. data must be program_size bytes of RAM.
+static void sector_write(uintptr_t addr, const void *data, size_t program_size) {
     uint32_t ints = save_and_disable_interrupts();
     flash_range_erase(addr - XIP_BASE, FLASH_SECTOR_SIZE);
-    restore_interrupts(ints);
-}
-
-#define SCRATCH_PROGRAM_SIZE (((sizeof(puf_scratch_t) + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE)
-_Static_assert(SCRATCH_PROGRAM_SIZE <= FLASH_SECTOR_SIZE, "PUF scratch must fit one sector");
-
-static void scratch_write(uintptr_t addr, const puf_scratch_t *scratch) {
-    uint8_t *page = malloc(SCRATCH_PROGRAM_SIZE);
-    if (page == NULL) {
-        return;
+    if (data != NULL) {
+        flash_range_program(addr - XIP_BASE, data, program_size);
     }
-    memset(page, 0xFF, SCRATCH_PROGRAM_SIZE);
-    memcpy(page, scratch, sizeof(*scratch));
-    uint32_t ints = save_and_disable_interrupts();
-    flash_range_erase(addr - XIP_BASE, FLASH_SECTOR_SIZE);
-    flash_range_program(addr - XIP_BASE, page, SCRATCH_PROGRAM_SIZE);
     restore_interrupts(ints);
-    mbedtls_platform_zeroize(page, SCRATCH_PROGRAM_SIZE);
-    free(page);
 }
 
 void puf_init(void) {
     if (low_flash_storage_locked()) {
         return;
     }
-    const uintptr_t scratch_addr = __phymarker_start - FLASH_SECTOR_SIZE;
-    file_t *ef = file_search(EF_PUF_HELPER);
-    const bool helper_present = file_has_data(ef);
-    puf_scratch_t *scratch = malloc(sizeof(*scratch));
-    puf_helper_t *helper = calloc(1, sizeof(*helper));
-    if (!layout_ok(scratch_addr) || scratch == NULL || helper == NULL) {
+    const uintptr_t sector = __phymarker_start - FLASH_SECTOR_SIZE;
+    const bool helper_present = *(const uint32_t *)sector == PUF_HELPER_MAGIC;
+    // Page-rounded so they can be programmed as they are; the tail stays 0xFF.
+    puf_scratch_t *scratch = malloc(SCRATCH_BUF_SIZE);
+    puf_helper_t *helper = malloc(HELPER_BUF_SIZE);
+    if (!layout_ok(sector) || scratch == NULL || helper == NULL) {
         printf("PUF: unavailable (layout or memory)\n");
         puf_status = helper_present ? PUF_STATUS_FAILED : PUF_STATUS_OFF;
         free(scratch);
         free(helper);
         return;
     }
-    memcpy(scratch, (const void *)scratch_addr, sizeof(*scratch));
-    if (helper_present && file_get_size(ef) == sizeof(*helper)) {
-        memcpy(helper, file_get_data(ef), sizeof(*helper));
+    memset(scratch, 0xFF, SCRATCH_BUF_SIZE);
+    memset(helper, 0xFF, HELPER_BUF_SIZE);
+    memset(helper, 0, sizeof(*helper));
+    if (helper_present) {
+        memcpy(helper, (const void *)sector, sizeof(*helper));
+    }
+    else {
+        memcpy(scratch, (const void *)sector, sizeof(*scratch));
     }
 
     puf_actions_t act;
     puf_boot_result_t r = puf_boot_step((const uint8_t *)PUF_SRAM_BASE, power_on_reset(),
                                         scratch, helper, helper_present, rng, key_buf, &act);
-    if (act.scratch_erase) {
-        scratch_erase(scratch_addr);
-    }
-    if (act.scratch_write) {
-        scratch_write(scratch_addr, scratch);
-    }
-    if (act.helper_delete) {
-        file_delete(ef);
-    }
+    // With a helper present the scratch copy stays blank, so scratch_erase
+    // never fires and cannot wipe the helper sharing the sector.
     if (act.helper_write) {
-        file_t *out = file_new(EF_PUF_HELPER);
-        if (out) {
-            file_put_data(out, CONST_BYTE_ARRAY((const uint8_t *)helper, sizeof(*helper)));
-            flash_commit();
-        }
+        sector_write(sector, helper, HELPER_BUF_SIZE);
     }
-    mbedtls_platform_zeroize(scratch, sizeof(*scratch));
+    else if (act.scratch_write) {
+        sector_write(sector, scratch, SCRATCH_BUF_SIZE);
+    }
+    else if (act.scratch_erase || act.helper_delete) {
+        sector_write(sector, NULL, 0);
+    }
+    mbedtls_platform_zeroize(scratch, SCRATCH_BUF_SIZE);
     free(scratch);
     free(helper);
 
