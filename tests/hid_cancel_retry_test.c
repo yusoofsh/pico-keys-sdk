@@ -1870,6 +1870,53 @@ static void scene_ping_echo_during_completion(void) {
            "completion does not corrupt the response identity\n");
 }
 
+static bool is_idle_after_timeout(void) {
+    return worker_timed_out == 1 && !is_busy();
+}
+
+/* A pending UP wait that is never answered must keep the host informed: the
+ * transport sends a UPNEEDED keepalive (status 2) on the request's channel
+ * at the throttled cadence for the whole wait, not just at its start. */
+static void scene_no_press_keepalive(void) {
+    static const uint8_t payload[] = { 0x01, 0xa1 };
+
+    write_btn("none");
+    write_btn("timeout:0");
+    channel_setup();
+
+    mock_up_push(true);
+    build_cbor(payload, sizeof(payload));
+    send_report();
+    assert(spin_until(is_req_button_pending, 2000));
+
+    int wait_start = tx_count, wait_mid = -1;
+    /* The worker model's wait times out at 2 s; observe 1.8 s of it. */
+    for (unsigned waited = 0; waited < 1800; waited += 2) {
+        if (waited == 900) {
+            wait_mid = tx_count;
+        }
+        usleep(2000);
+        hid_task();
+        button_task();
+    }
+    int upneeded = 0, upneeded_late = 0;
+    for (int i = wait_start; i < tx_count; i++) {
+        const uint8_t *f = tx_frames[i];
+        if (f[4] == CTAPHID_KEEPALIVE && frame_has_cid(f, CID)) {
+            assert(f[6] == 1 && f[7] == 2);
+            upneeded++;
+            upneeded_late += i >= wait_mid;
+        }
+    }
+    printf("no_press_keepalive: %d UPNEEDED keepalives in 1.8 s, %d in the second half\n", upneeded, upneeded_late);
+    /* Exact counts depend on host scheduling; the contract is that they
+       keep coming after the wait has been running for a while. */
+    assert(upneeded >= 3);
+    assert(upneeded_late >= 1);
+    assert(worker_pressed == 0 && worker_cancelled == 0);
+    assert(spin_until(is_idle_after_timeout, 2000));
+}
+
 int main(int argc, char **argv) {
     assert(argc == 2);
     /* Hard step budget: a deadlock (e.g. a blocking handshake while a UP
@@ -1909,6 +1956,9 @@ int main(int argc, char **argv) {
     }
     else if (strcmp(argv[1], "ping_echo_during_completion") == 0) {
         scene_ping_echo_during_completion();
+    }
+    else if (strcmp(argv[1], "no_press_keepalive") == 0) {
+        scene_no_press_keepalive();
     }
     else if (strcmp(argv[1], "randomized_a") == 0) {
         scene_randomized(0x5EED0001ull, 800);
