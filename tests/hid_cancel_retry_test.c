@@ -1890,9 +1890,11 @@ static void scene_no_press_keepalive(void) {
     assert(spin_until(is_req_button_pending, 2000));
 
     int wait_start = tx_count, wait_mid = -1;
-    /* The worker model's wait times out at 2 s; observe 1.8 s of it. */
-    for (unsigned waited = 0; waited < 1800; waited += 2) {
-        if (waited == 900) {
+    /* The worker model's wait times out at 2 s of wall-clock time; observe
+       1.8 s of it by the same clock, so a slow host cannot outlive it. */
+    uint32_t t0 = board_millis();
+    for (uint32_t waited = 0; waited < 1800; waited = board_millis() - t0) {
+        if (wait_mid < 0 && waited >= 900) {
             wait_mid = tx_count;
         }
         usleep(2000);
@@ -1917,6 +1919,63 @@ static void scene_no_press_keepalive(void) {
     assert(spin_until(is_idle_after_timeout, 2000));
 }
 
+/* CTAPHID_CANCEL only cancels the outstanding request of its own channel.
+ * A CANCEL from another channel (another app, or a browser that opens a new
+ * channel per request) must leave channel A's pending UP wait untouched: no
+ * fabricated 0x2D anywhere, keepalives keep flowing on A, and a press still
+ * completes A with its framed response. */
+static void scene_foreign_cancel_ignored(void) {
+    static const uint8_t payload[] = { 0x04, 0xee };
+    static const uint32_t CID_B = 0x55667788;
+
+    write_btn("none");
+    write_btn("timeout:0");
+    channel_setup();
+
+    mock_up_push(true);
+    build_cbor(payload, sizeof(payload));
+    send_report();
+    assert(spin_until(is_req_button_pending, 2000));
+
+    int before = tx_count;
+    build_cancel();
+    put32(report, CID_B);
+    send_report();
+    for (unsigned waited = 0; waited < 900; waited += 2) {
+        usleep(2000);
+        hid_task();
+        button_task();
+    }
+    assert(find_cbor_status_frame(CTAPHID_KEEPALIVE_CANCEL_STATUS, before) < 0);
+    assert(!exec_finished_cancelled);
+    assert(is_req_button_pending() && worker_cancelled == 0);
+    int keepalives = 0;
+    for (int i = before; i < tx_count; i++) {
+        if (tx_frames[i][4] == CTAPHID_KEEPALIVE && frame_has_cid(tx_frames[i], CID)) {
+            keepalives++;
+        }
+    }
+    assert(keepalives >= 1);
+
+    write_btn("press");
+    bool response_seen = false;
+    for (unsigned waited = 0; waited < 4000 && !response_seen; waited += 2) {
+        for (int i = before; i < tx_count; i++) {
+            const uint8_t *f = tx_frames[i];
+            if (frame_has_cid(f, CID) && f[4] == CTAPHID_CBOR && f[5] == 0 && f[6] == 2 && f[7] == 0x00 && f[8] == 1) {
+                response_seen = true;
+            }
+        }
+        if (!response_seen) {
+            usleep(2000);
+            hid_task();
+            button_task();
+        }
+    }
+    assert(response_seen);
+    assert(worker_pressed == 1 && worker_cancelled == 0);
+    printf("foreign_cancel_ignored: %d keepalives after a foreign CANCEL; the press completes channel A\n", keepalives);
+}
 int main(int argc, char **argv) {
     assert(argc == 2);
     /* Hard step budget: a deadlock (e.g. a blocking handshake while a UP
@@ -1959,6 +2018,9 @@ int main(int argc, char **argv) {
     }
     else if (strcmp(argv[1], "no_press_keepalive") == 0) {
         scene_no_press_keepalive();
+    }
+    else if (strcmp(argv[1], "foreign_cancel_ignored") == 0) {
+        scene_foreign_cancel_ignored();
     }
     else if (strcmp(argv[1], "randomized_a") == 0) {
         scene_randomized(0x5EED0001ull, 800);

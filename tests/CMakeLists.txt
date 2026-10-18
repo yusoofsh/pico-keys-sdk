@@ -177,7 +177,7 @@ else()
     target_compile_options(hid_cancel_retry_test PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(hid_cancel_retry_test PRIVATE pthread)
 endif()
-foreach(scene IN ITEMS fast_retry fast_retry_fragmented fast_retry_max_size cancel_before_wait_start settled_retry no_retry_after_cancel press_control competing_cid_during_unwind init_after_cancel_active_wait init_during_active_wait ping_echo_during_completion no_press_keepalive randomized_a randomized_b randomized_c)
+foreach(scene IN ITEMS fast_retry fast_retry_fragmented fast_retry_max_size cancel_before_wait_start settled_retry no_retry_after_cancel press_control competing_cid_during_unwind init_after_cancel_active_wait init_during_active_wait ping_echo_during_completion no_press_keepalive foreign_cancel_ignored randomized_a randomized_b randomized_c)
     add_test(NAME hid_cancel_retry_${scene} COMMAND hid_cancel_retry_test ${scene})
 endforeach()
 
