@@ -39,6 +39,7 @@
 #include "usb.h"
 #include "flash.h"
 #include "otp.h"
+#include "puf.h"
 #include "led/led.h"
 #include "pico_time.h"
 #include "serial.h"
@@ -150,6 +151,8 @@ int main(void) {
         if (rescue_migrate_keydev() != PICOKEYS_OK) {
             printf("Device attestation key migration failed\n");
         }
+
+        puf_init();
     }
 
     init_rtc();
@@ -159,6 +162,8 @@ int main(void) {
 #endif
 
     led_init();
+
+    puf_halt_if_failed();
 
     picokey_early_init();
 
