@@ -31,8 +31,14 @@
 #define USB_PID   0x10FD
 #endif
 
+// A USB 2.1 device must answer the BOS request, and Windows fails enumeration
+// when it stalls. The BOS (WebUSB + MS OS 2.0) only exists with USB_ITF_WCID.
 #if defined(PICO_PLATFORM) || defined(ESP_PLATFORM)
+#ifdef USB_ITF_WCID
 #define USB_BCD   0x0210
+#else
+#define USB_BCD   0x0200
+#endif
 #else
 #define USB_BCD   0x0110
 #endif
