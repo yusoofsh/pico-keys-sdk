@@ -127,7 +127,7 @@ void button_wait_start_timeout(uint32_t timeout_seconds) {
         return;
     }
     if (button_timeout == 0) {
-        button_timeout = 30000;
+        button_timeout = FORCE_BUTTON_WAIT_DEFAULT_TIMEOUT_SECONDS * 1000u;
     }
     signal_user_presence_request_data_t data = {
         .timeout = button_timeout / 1000,
@@ -244,7 +244,7 @@ void button_wait_start_timeout(uint32_t timeout_seconds) {
     if (button_timeout == 0) {
         /* FORCE_BUTTON_WAIT builds turn a configured timeout of 0 into a
            nonzero wait, like the firmware path. */
-        button_timeout = 30000;
+        button_timeout = FORCE_BUTTON_WAIT_DEFAULT_TIMEOUT_SECONDS * 1000u;
     }
     signal_user_presence_request_data_t data = {
         .timeout = button_timeout / 1000,

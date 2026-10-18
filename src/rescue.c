@@ -474,6 +474,19 @@ static int cmd_read(void) {
             res_APDU_size += put_uint32_be((uint32_t)tv_sec, res_APDU);
         }
     }
+    else if (p1 == 0x6) { // BOARD DIAGNOSTICS
+        if (p2 != 0) {
+            return SW_INCORRECT_P1P2();
+        }
+        uint16_t diagnostics_size = picokey_read_diagnostics(res_APDU, 8);
+        if (diagnostics_size == 0) {
+            return SW_FUNC_NOT_SUPPORTED();
+        }
+        if (diagnostics_size > 8) {
+            return SW_EXEC_ERROR();
+        }
+        res_APDU_size = diagnostics_size;
+    }
 #ifdef ENABLE_DIAGNOSTICS
     else if (p1 == 0x5) { // LAST ERROR
         file_t *file = file_search(DEBUG_LAST_ERROR_FID);

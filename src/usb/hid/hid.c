@@ -571,6 +571,14 @@ int driver_process_usb_packet_hid(uint16_t read) {
             return ctap_error(CTAP1_ERR_CHANNEL_BUSY);
         }
         if (FRAME_TYPE(ctap_req) == TYPE_INIT && ctap_req->init.cmd == CTAPHID_CANCEL) {
+            /* CTAPHID_CANCEL only affects its own channel's request. Acting
+             * on another channel's CANCEL aborted the real request silently:
+             * its completion was dropped, keepalives stopped (cancel_button)
+             * and the 0x2D went to the wrong channel, so the requesting host
+             * hung until its own timeout. */
+            if (hid_txn_state != HID_TXN_IDLE && ctap_req->cid != hid_txn_cid) {
+                return 0;
+            }
             bool active_transaction = is_busy();
             msg_packet.len = msg_packet.current_len = 0;
             last_packet_time = 0;

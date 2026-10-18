@@ -65,6 +65,12 @@ WEAK void picokey_early_init(void) {
 WEAK void picokey_task(void) {
 }
 
+WEAK uint16_t picokey_read_diagnostics(uint8_t *buffer, uint16_t capacity) {
+    (void)buffer;
+    (void)capacity;
+    return 0;
+}
+
 void execute_tasks(void);
 void execute_tasks(void) {
 #if !defined(ENABLE_EMULATION) && !defined(ESP_PLATFORM)

@@ -21,6 +21,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* WebAuthn recommends a 300-second default ceremony timeout. Keep forced
+ * Pipico user-presence waits open for that window unless the host cancels. */
+#define FORCE_BUTTON_WAIT_DEFAULT_TIMEOUT_SECONDS 300u
+
 #if defined(ESP_PLATFORM)
 #define BOOT_PIN GPIO_NUM_0
 #endif

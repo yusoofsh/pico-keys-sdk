@@ -19,6 +19,7 @@
 #define _LED_H_
 
 #include <stdint.h>
+#include <stdbool.h>
 
 enum {
     LED_COLOR_OFF = 0,
@@ -50,20 +51,42 @@ enum {
 // steady on
 #define LED_ON_NO_BLINK     ((1000 << LED_ON_SHIFT) | (0 << LED_OFF_SHIFT))
 
+#if defined(VCC_GND_YD_RP2040_BUTTON_PIN) && defined(PICO_DEFAULT_LED_PIN)
+// The YD-RP2040's monochrome status LED cannot distinguish the color-coded
+// modes, so use timing to separate idle heartbeat from a user-presence prompt.
+#define LED_STATUS_ON_MS 100
+#define LED_STATUS_OFF_MS 1900
+#define LED_BUTTON_ON_MS 50
+#define LED_BUTTON_OFF_MS 50
+#else
+#define LED_STATUS_ON_MS 500
+#define LED_STATUS_OFF_MS 500
+#define LED_BUTTON_ON_MS 1000
+#define LED_BUTTON_OFF_MS 100
+#endif
+
 enum  {
-    MODE_NOT_MOUNTED = (MAX_BTNESS << LED_BTNESS_SHIFT) | (LED_COLOR_RED << LED_COLOR_SHIFT) | (500 << LED_ON_SHIFT) | (500 << LED_OFF_SHIFT),
-    MODE_MOUNTED     = (MAX_BTNESS << LED_BTNESS_SHIFT) | (LED_COLOR_GREEN << LED_COLOR_SHIFT) | (500 << LED_ON_SHIFT) | (500 << LED_OFF_SHIFT),
+    MODE_NOT_MOUNTED = (MAX_BTNESS << LED_BTNESS_SHIFT) | (LED_COLOR_RED << LED_COLOR_SHIFT) | (LED_STATUS_ON_MS << LED_ON_SHIFT) | (LED_STATUS_OFF_MS << LED_OFF_SHIFT),
+    MODE_MOUNTED     = (MAX_BTNESS << LED_BTNESS_SHIFT) | (LED_COLOR_GREEN << LED_COLOR_SHIFT) | (LED_STATUS_ON_MS << LED_ON_SHIFT) | (LED_STATUS_OFF_MS << LED_OFF_SHIFT),
     MODE_SUSPENDED   = (MAX_BTNESS << LED_BTNESS_SHIFT) | (LED_COLOR_BLUE << LED_COLOR_SHIFT) | (1000 << LED_ON_SHIFT) | (2000 << LED_OFF_SHIFT),
     MODE_PROCESSING  = (MAX_BTNESS << LED_BTNESS_SHIFT) | (LED_COLOR_GREEN << LED_COLOR_SHIFT) | (50 << LED_ON_SHIFT) | (50 << LED_OFF_SHIFT),
-    MODE_BUTTON      = (MAX_BTNESS << LED_BTNESS_SHIFT) | (LED_COLOR_YELLOW << LED_COLOR_SHIFT) | (1000 << LED_ON_SHIFT) | (100 << LED_OFF_SHIFT),
+    MODE_BUTTON      = (MAX_BTNESS << LED_BTNESS_SHIFT) | (LED_COLOR_YELLOW << LED_COLOR_SHIFT) | (LED_BUTTON_ON_MS << LED_ON_SHIFT) | (LED_BUTTON_OFF_MS << LED_OFF_SHIFT),
 
     MODE_ALWAYS_ON   = UINT32_MAX,
     MODE_ALWAYS_OFF  = 0
 };
 
+#undef LED_STATUS_ON_MS
+#undef LED_STATUS_OFF_MS
+#undef LED_BUTTON_ON_MS
+#undef LED_BUTTON_OFF_MS
+
 extern void led_set_mode(uint32_t mode);
 extern uint32_t led_get_mode(void);
 extern void led_blink_n_times(uint8_t count, uint8_t color, uint32_t on_ms, uint32_t off_ms);
+/* Request a short, nonessential indication without preempting an existing
+ * FIDO blink or a high-priority LED mode. Returns false when it was skipped. */
+extern bool led_try_blink_n_times(uint8_t count, uint8_t color, uint32_t on_ms, uint32_t off_ms);
 extern void led_blinking_task(void);
 extern void led_off_all(void);
 extern void led_init(void);

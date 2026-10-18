@@ -67,6 +67,7 @@ extern int picokey_init(void);
  * loop iteration after button_task() and must never block. */
 extern void picokey_early_init(void);
 extern void picokey_task(void);
+extern uint16_t picokey_read_diagnostics(uint8_t *buffer, uint16_t capacity);
 
 extern void low_flash_init_core1(void);
 

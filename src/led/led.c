@@ -33,6 +33,9 @@ static volatile uint8_t blink_count = 0;
 static volatile uint8_t blink_color = LED_COLOR_GREEN;
 static volatile uint32_t blink_on_ms = 0;
 static volatile uint32_t blink_off_ms = 0;
+/* Kept outside led_blinking_task so optional indications can refuse to
+ * preempt an active FIDO indication. All callers run on the main core. */
+static bool blink_active = false;
 
 void led_set_mode(uint32_t mode) {
     led_mode = mode;
@@ -53,13 +56,32 @@ void led_blink_n_times(uint8_t count, uint8_t color, uint32_t on_ms, uint32_t of
     blink_pending = true;
 }
 
+bool led_try_blink_n_times(uint8_t count, uint8_t color, uint32_t on_ms, uint32_t off_ms) {
+    if (count == 0 || on_ms == 0 || off_ms == 0 || blink_pending || blink_active) {
+        return false;
+    }
+    /* These modes represent an in-progress FIDO interaction. An optional
+     * companion acknowledgement must never replace their visual feedback. */
+    uint32_t mode = led_get_mode();
+    /* MODE_SUSPENDED also denotes an idle card after card_exit(), even
+     * when USB is awake. The companion gates actual USB suspension. */
+    if (mode == MODE_PROCESSING || mode == MODE_BUTTON) {
+        return false;
+    }
+    blink_count = count;
+    blink_color = color;
+    blink_on_ms = on_ms;
+    blink_off_ms = off_ms;
+    blink_pending = true;
+    return true;
+}
+
 void led_blinking_task(void) {
 #if defined(PICO_PLATFORM) || defined(ESP_PLATFORM)
     static uint32_t start_ms = 0;
     static uint32_t stop_ms = 0;
     static uint32_t last_led_update_ms = 0;
     static uint8_t led_state = false;
-    static bool blink_active = false;
     static bool blink_on = false;
     static uint8_t blinks_remaining = 0;
     static uint8_t active_blink_color = LED_COLOR_GREEN;
@@ -176,6 +198,12 @@ void led_init(void) {
     led_driver = &led_driver_cyw43;
     phy_data.led_driver = phy_data.led_driver_present ? phy_data.led_driver : PHY_LED_DRIVER_CYW43;
     phy_data.led_gpio = phy_data.led_gpio_present ? phy_data.led_gpio : CYW43_WL_GPIO_LED_PIN;
+#elif defined(VCC_GND_YD_RP2040_BUTTON_PIN) && defined(PICO_DEFAULT_LED_PIN)
+    // Some YD-RP2040 boards leave the RGB LED solder link open. Prefer the
+    // always-connected status LED so FIDO presence prompts remain visible.
+    led_driver = &led_driver_pico;
+    phy_data.led_driver = phy_data.led_driver_present ? phy_data.led_driver : PHY_LED_DRIVER_PICO;
+    phy_data.led_gpio = phy_data.led_gpio_present ? phy_data.led_gpio : PICO_DEFAULT_LED_PIN;
 #elif defined(PICO_DEFAULT_WS2812_PIN)
     led_driver = &led_driver_ws2812;
     phy_data.led_driver = phy_data.led_driver_present ? phy_data.led_driver : PHY_LED_DRIVER_WS2812;
